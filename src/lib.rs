@@ -4,5 +4,6 @@ pub mod context;
 pub mod event;
 pub mod movement;
 pub mod pawn;
+pub mod play;
 pub mod player;
 pub mod rules;
