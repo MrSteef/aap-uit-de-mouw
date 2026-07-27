@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use thiserror::Error;
+
 /// Identifies a single space on the board.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct SpaceId(pub u32);
@@ -56,6 +58,17 @@ pub enum NextSpace {
     DeadEnd,
 }
 
+/// Ways a `BoardTopology` operation can fail.
+#[derive(Error, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BoardError {
+    #[error("a board needs at least one player")]
+    NoPlayers,
+    #[error("ring length {ring_len} can't fit an entry point for each of {num_players} players")]
+    RingTooShortForPlayers { ring_len: u16, num_players: u8 },
+    #[error("no space exists with id {0:?}")]
+    UnknownSpace(SpaceId),
+}
+
 /// The board as a directed graph of spaces.
 #[derive(Clone, Debug)]
 pub struct BoardTopology {
@@ -64,9 +77,12 @@ pub struct BoardTopology {
 }
 
 impl BoardTopology {
-    /// The space with the given id.
-    pub fn node(&self, id: SpaceId) -> &SpaceNode {
-        &self.nodes[id.0 as usize]
+    /// The space with the given id, or `Err` if no such space exists on this
+    /// board.
+    pub fn node(&self, id: SpaceId) -> Result<&SpaceNode, BoardError> {
+        self.nodes
+            .get(id.0 as usize)
+            .ok_or(BoardError::UnknownSpace(id))
     }
 
     /// The yard spaces belonging to a color, empty if that color has none.
@@ -77,25 +93,29 @@ impl BoardTopology {
             .unwrap_or(&[])
     }
 
-    /// What a pawn of `owner`'s color may move to next from `from`.
-    pub fn next_space(&self, from: SpaceId, owner: PlayerColor) -> NextSpace {
+    /// What a pawn of `owner`'s color may move to next from `from`, or `Err`
+    /// if `from` isn't a space on this board.
+    pub fn next_space(&self, from: SpaceId, owner: PlayerColor) -> Result<NextSpace, BoardError> {
         let eligible = |e: &&Edge| e.restricted_to.is_none() || e.restricted_to == Some(owner);
-        let node = self.node(from);
+        let node = self.node(from)?;
         if let Some(forced) = node.edges.iter().find(|e| e.forced && eligible(e)) {
-            return NextSpace::Single(forced.to);
+            return Ok(NextSpace::Single(forced.to));
         }
         let candidates: Vec<SpaceId> = node.edges.iter().filter(eligible).map(|e| e.to).collect();
-        match candidates.len() {
+        Ok(match candidates.len() {
             0 => NextSpace::DeadEnd,
             1 => NextSpace::Single(candidates[0]),
             _ => NextSpace::Branch(candidates),
-        }
+        })
     }
 
     /// Builds a symmetric ring-plus-home-lanes board: `num_players` colors
     /// evenly spaced around a shared ring of `ring_len` spaces, each with
     /// `pawns_per_player` yard spaces and a private home lane of
     /// `home_lane_len` spaces leading to that color's Finish.
+    ///
+    /// Returns `Err` if `num_players` is zero, or if `ring_len` is too short
+    /// to give every color its own entry point.
     ///
     /// Custom or asymmetric boards are built the same way this one is —
     /// this is one recipe over `SpaceNode`/`Edge`, not a variant the types
@@ -105,12 +125,16 @@ impl BoardTopology {
         ring_len: u16,
         home_lane_len: u16,
         pawns_per_player: u8,
-    ) -> Self {
-        assert!(num_players > 0, "a board needs at least one player");
-        assert!(
-            ring_len >= num_players as u16,
-            "ring must fit at least one entry point per player"
-        );
+    ) -> Result<Self, BoardError> {
+        if num_players == 0 {
+            return Err(BoardError::NoPlayers);
+        }
+        if ring_len < num_players as u16 {
+            return Err(BoardError::RingTooShortForPlayers {
+                ring_len,
+                num_players,
+            });
+        }
 
         fn push_node(
             nodes: &mut Vec<SpaceNode>,
@@ -154,6 +178,10 @@ impl BoardTopology {
         let entry_of = |color: PlayerColor| ring_space(spacing * color.0 as u16);
         let fork_of = |color: PlayerColor| ring_space(spacing * color.0 as u16 + ring_len - 1);
 
+        // Every index used below (`ring_space`, `entry_of`, `fork_of`, and
+        // each yard slot) is a modular offset into the ring or an id handed
+        // back by `push_node` moments earlier, so it's always in bounds for
+        // this same `nodes` vec — there's no external input here to validate.
         for offset in 0..ring_len {
             let from = ring_space(offset).0 as usize;
             nodes[from].edges.push(Edge {
@@ -202,7 +230,7 @@ impl BoardTopology {
             });
         }
 
-        Self { nodes, yard_spaces }
+        Ok(Self { nodes, yard_spaces })
     }
 }
 
@@ -211,25 +239,55 @@ mod tests {
     use super::*;
 
     fn classic_board() -> BoardTopology {
-        BoardTopology::standard_ring(4, 40, 5, 4)
+        BoardTopology::standard_ring(4, 40, 5, 4).expect("classic layout is valid")
     }
 
     #[test]
-    fn yard_exit_edge_leads_to_that_colors_entry_point() {
+    fn standard_ring_rejects_zero_players() {
+        assert_eq!(
+            BoardTopology::standard_ring(0, 40, 5, 4).unwrap_err(),
+            BoardError::NoPlayers
+        );
+    }
+
+    #[test]
+    fn standard_ring_rejects_a_ring_too_short_for_every_player() {
+        assert_eq!(
+            BoardTopology::standard_ring(4, 3, 5, 4).unwrap_err(),
+            BoardError::RingTooShortForPlayers {
+                ring_len: 3,
+                num_players: 4
+            }
+        );
+    }
+
+    #[test]
+    fn node_reports_an_unknown_id_instead_of_panicking() {
+        let board = classic_board();
+        let bogus = SpaceId(u32::MAX);
+        assert_eq!(
+            board.node(bogus).unwrap_err(),
+            BoardError::UnknownSpace(bogus)
+        );
+    }
+
+    #[test]
+    fn yard_exit_edge_leads_to_that_colors_entry_point() -> Result<(), BoardError> {
         let board = classic_board();
         for p in 0..4 {
             let color = PlayerColor(p);
             for &yard_slot in board.yard_spaces(color) {
-                let NextSpace::Single(entry) = board.next_space(yard_slot, color) else {
+                let NextSpace::Single(entry) = board.next_space(yard_slot, color)? else {
                     panic!("yard exit should be a single unconditional edge");
                 };
-                assert_eq!(board.node(entry).kind, SpaceKind::Shared);
+                assert_eq!(board.node(entry)?.kind, SpaceKind::Shared);
                 assert!(
-                    board.node(entry).safe,
+                    board.node(entry)?.safe,
                     "a color's entry point should be safe"
                 );
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -242,101 +300,105 @@ mod tests {
     }
 
     #[test]
-    fn ring_traversal_wraps_all_the_way_around() {
+    fn ring_traversal_wraps_all_the_way_around() -> Result<(), BoardError> {
         let board = classic_board();
         let start = board.yard_spaces(PlayerColor(0))[0];
-        let NextSpace::Single(mut here) = board.next_space(start, PlayerColor(0)) else {
+        let NextSpace::Single(mut here) = board.next_space(start, PlayerColor(0))? else {
             panic!("expected the yard exit to land on the ring");
         };
         // Walking 39 plain ring steps from color 0's entry point should land
         // exactly on the fork just before completing the loop.
         for _ in 0..39 {
-            here = match board.next_space(here, PlayerColor(0)) {
+            here = match board.next_space(here, PlayerColor(0))? {
                 NextSpace::Single(next) => next,
                 other => panic!("expected a single ring step, got {other:?}"),
             };
         }
-        match board.next_space(here, PlayerColor(0)) {
+        match board.next_space(here, PlayerColor(0))? {
             NextSpace::Branch(options) => {
                 assert_eq!(options.len(), 2);
-                assert!(options.contains(&start_entry(&board, 0)));
+                assert!(options.contains(&start_entry(&board, 0)?));
             }
             other => panic!("expected the fork to offer a branch, got {other:?}"),
         }
+        Ok(())
     }
 
-    fn start_entry(board: &BoardTopology, color: u8) -> SpaceId {
+    fn start_entry(board: &BoardTopology, color: u8) -> Result<SpaceId, BoardError> {
         let NextSpace::Single(entry) =
-            board.next_space(board.yard_spaces(PlayerColor(color))[0], PlayerColor(color))
+            board.next_space(board.yard_spaces(PlayerColor(color))[0], PlayerColor(color))?
         else {
             panic!("expected a single yard exit edge");
         };
-        entry
+        Ok(entry)
     }
 
     #[test]
-    fn fork_is_a_branch_for_the_owning_color_but_a_single_edge_for_others() {
+    fn fork_is_a_branch_for_the_owning_color_but_a_single_edge_for_others() -> Result<(), BoardError>
+    {
         let board = classic_board();
-        let entry0 = start_entry(&board, 0);
+        let entry0 = start_entry(&board, 0)?;
         // Walk backwards conceptually by walking forward 39 steps from entry0.
         let mut here = entry0;
         for _ in 0..39 {
-            here = match board.next_space(here, PlayerColor(0)) {
+            here = match board.next_space(here, PlayerColor(0))? {
                 NextSpace::Single(next) => next,
                 other => panic!("expected a single ring step, got {other:?}"),
             };
         }
         let fork = here;
 
-        match board.next_space(fork, PlayerColor(0)) {
+        match board.next_space(fork, PlayerColor(0))? {
             NextSpace::Branch(options) => {
                 assert_eq!(options.len(), 2);
                 assert!(options.contains(&entry0));
             }
             other => panic!("owning color should see a branch, got {other:?}"),
         }
-        match board.next_space(fork, PlayerColor(1)) {
+        match board.next_space(fork, PlayerColor(1))? {
             NextSpace::Single(next) => assert_eq!(next, entry0),
             other => panic!("other colors should see only the ring continuing, got {other:?}"),
         }
+        Ok(())
     }
 
     #[test]
-    fn home_lane_chain_ends_at_a_dead_end_finish() {
+    fn home_lane_chain_ends_at_a_dead_end_finish() -> Result<(), BoardError> {
         let board = classic_board();
-        let entry0 = start_entry(&board, 0);
+        let entry0 = start_entry(&board, 0)?;
         let mut here = entry0;
         for _ in 0..39 {
-            here = match board.next_space(here, PlayerColor(0)) {
+            here = match board.next_space(here, PlayerColor(0))? {
                 NextSpace::Single(next) => next,
                 other => panic!("expected a single ring step, got {other:?}"),
             };
         }
         let fork = here;
-        let lane_entry = match board.next_space(fork, PlayerColor(0)) {
+        let lane_entry = match board.next_space(fork, PlayerColor(0))? {
             NextSpace::Branch(options) => *options.iter().find(|&&s| s != entry0).unwrap(),
             other => panic!("expected a branch at the fork, got {other:?}"),
         };
 
         let mut here = lane_entry;
-        assert_eq!(board.node(here).kind, SpaceKind::HomeLane);
+        assert_eq!(board.node(here)?.kind, SpaceKind::HomeLane);
         for _ in 0..4 {
-            here = match board.next_space(here, PlayerColor(0)) {
+            here = match board.next_space(here, PlayerColor(0))? {
                 NextSpace::Single(next) => next,
                 other => panic!("expected a single home lane step, got {other:?}"),
             };
-            assert_eq!(board.node(here).kind, SpaceKind::HomeLane);
+            assert_eq!(board.node(here)?.kind, SpaceKind::HomeLane);
         }
-        here = match board.next_space(here, PlayerColor(0)) {
+        here = match board.next_space(here, PlayerColor(0))? {
             NextSpace::Single(next) => next,
             other => panic!("expected the last lane step to reach Finish, got {other:?}"),
         };
-        assert_eq!(board.node(here).kind, SpaceKind::Finish);
-        assert_eq!(board.next_space(here, PlayerColor(0)), NextSpace::DeadEnd);
+        assert_eq!(board.node(here)?.kind, SpaceKind::Finish);
+        assert_eq!(board.next_space(here, PlayerColor(0))?, NextSpace::DeadEnd);
+        Ok(())
     }
 
     #[test]
-    fn restricted_edge_is_a_dead_end_for_a_different_color() {
+    fn restricted_edge_is_a_dead_end_for_a_different_color() -> Result<(), BoardError> {
         // Manually built, minimal topology: one space with a single edge
         // restricted to color 0, and nothing else.
         let restricted_target = SpaceId(1);
@@ -364,17 +426,18 @@ mod tests {
         };
 
         assert_eq!(
-            board.next_space(SpaceId(0), PlayerColor(0)),
+            board.next_space(SpaceId(0), PlayerColor(0))?,
             NextSpace::Single(restricted_target)
         );
         assert_eq!(
-            board.next_space(SpaceId(0), PlayerColor(1)),
+            board.next_space(SpaceId(0), PlayerColor(1))?,
             NextSpace::DeadEnd
         );
+        Ok(())
     }
 
     #[test]
-    fn forced_edge_overrides_every_other_eligible_edge() {
+    fn forced_edge_overrides_every_other_eligible_edge() -> Result<(), BoardError> {
         let forced_target = SpaceId(1);
         let optional_target = SpaceId(2);
         let node = SpaceNode {
@@ -417,12 +480,13 @@ mod tests {
         // The forced edge only applies to color 0; color 1 still sees the
         // plain, unrestricted edge as its only option.
         assert_eq!(
-            board.next_space(SpaceId(0), PlayerColor(0)),
+            board.next_space(SpaceId(0), PlayerColor(0))?,
             NextSpace::Single(forced_target)
         );
         assert_eq!(
-            board.next_space(SpaceId(0), PlayerColor(1)),
+            board.next_space(SpaceId(0), PlayerColor(1))?,
             NextSpace::Single(optional_target)
         );
+        Ok(())
     }
 }
