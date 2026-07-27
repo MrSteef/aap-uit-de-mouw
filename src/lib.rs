@@ -1,3 +1,8 @@
 pub mod board;
 pub mod card;
+pub mod context;
+pub mod event;
+pub mod movement;
+pub mod pawn;
+pub mod player;
 pub mod rules;
