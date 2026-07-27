@@ -499,17 +499,66 @@ impl<'a> AuditContext<'a> {
 }
 ```
 
-**Implementation status.** `EffectAnchor` (shown above under `PlayContext`) actually
-lives in `pawn.rs` instead: `PersistentEffectState` (§8) needs it, and this
-section's own dependency graph (§1) has `context` depend on `pawn`, never the
-reverse — defining it here would create a cycle. `resolve_movement` returns
-`Result<(), MoveError>` rather than `()`, since `movement::walk` (§6) can
-fail and that needs to surface as a `Result`, not a panic. `PlayContext` also
-has a `new(...)` constructor (all its fields are private) that isn't shown
-above. `resolve_movement`'s capture dispatch isn't wired up yet — it moves
-the mover and emits `PawnMoved`, but doesn't call `attempt_capture` for
-touched squares yet, since `attempt_capture` itself is still `todo!()` until
-Pawn's real persistent-effect state and Shield exist (§16 steps 6–7).
+**Implementation status.** Fully implemented (§16 steps 3, 4, and 7), with
+several deviations from what's shown above:
+
+- `EffectAnchor` actually lives in `pawn.rs`: `PersistentEffectState` (§8)
+  needs it, and this section's own dependency graph (§1) has `context`
+  depend on `pawn`, never the reverse — defining it here would create a
+  cycle.
+- `resolve_movement` returns `Result<Vec<(PawnId, SpaceId)>, MoveError>`,
+  not `()`. The `Result` is for the same reason as before (`movement::walk`
+  can fail); the `Vec` reports every pawn it captured, as
+  `(pawn, position)` pairs, since the caller needs that to build the
+  mover's eventual `MoveRecord.captures_caused` — nothing else surfaces
+  this data.
+- `PlayContext` has a `new(...)` constructor (all its fields are private)
+  and a `current_card: Option<CardKindId>` field, set by a `begin_card(id)`
+  method the caller invokes just before dispatching `on_played`/
+  `on_claimed` for a given card. This is the concrete mechanism behind "the
+  context already knows which card that is" in `attach_persistent_effect`'s
+  doc comment above.
+- `attach_persistent_effect` gains an `expires: Option<ExpiryCondition>`
+  parameter — needed so `ShieldCard` (§5) can actually populate
+  `PersistentEffectState.expires`; there was no way to do so otherwise.
+  `PlayContext` also gains `attach_claimed_effect(&mut self, anchor:
+  EffectAnchor)`, entirely new: something has to attach a
+  `ClaimedEffectState` when a card is *claimed* (as opposed to `on_played`
+  attaching the real one), and nothing above shows how — `ShieldCard`'s
+  `on_claimed` (§5) calls it. Only `EffectAnchor::Pawn` is meaningful for
+  claims; `ClaimedEffectState` has no space-anchored equivalent
+  (§8), so a `Space`-anchored claim is silently dropped.
+- `attempt_capture` takes an added `is_landing: bool` parameter — only the
+  caller (`resolve_movement`) knows whether a given square is the move's
+  final one or a mid-path square under `CaptureMode::EveryStepPassed`, and
+  `InteractionContext.is_landing` needs that fact from somewhere.
+- `InteractionContext` gains `topology`, `rules`, and `pawns` fields (all
+  types `context` already depends on elsewhere, so no new dependency-graph
+  edge) so `trigger_automatic_audit` can actually perform a revert — see
+  its own implementation-status note below.
+- `AuditContext` gains a `new(...)` constructor, for the same private-field
+  reason as `PlayContext`.
+
+`trigger_automatic_audit`'s revert mechanics are shared with
+`audit::resolve` (§9) via `pawn::revert` — see §8's implementation-status
+note for why that lives in `pawn.rs` rather than `audit.rs`. Two
+simplifications, both flagged in code comments:
+- It tests the defender's *newest* auditable move, not necessarily the
+  specific move that attached the effect being tested —
+  `PersistentEffectState`/`ClaimedEffectState` don't record which history
+  entry created them, and safely linking one (indices shift as older moves
+  age out) is a bigger structural change than this step's scope. In
+  practice a capture attempt follows shortly after the relevant claim/play,
+  so the newest move is almost always the right one.
+- It clears *all* of the defender's claimed effects once tested (matching
+  `claimed_effects`'s own doc comment: "resolved... the moment
+  `trigger_automatic_audit` tests them, one way or another"), not just the
+  one actually responsible, for the same reason.
+
+Also out of scope, matching `audit::resolve`'s own scoping (§9): routing
+any collected cards to the shared pile
+(`RuleConfig::automatic_audit_reward_destination`) — that's `GameState`'s
+job (§16 step 8).
 
 ---
 
@@ -569,15 +618,13 @@ impl CardCatalog {
 }
 ```
 
-**Implementation status.** `on_audited_as_played`/`on_audited_as_claimed`
-aren't defined on `CardBehavior` yet — they take an `AuditOutcome`, which
-doesn't exist until `audit.rs` lands (§16 step 6); they're added then.
-`CardCatalog::get` returns `Option<&CardMeta>` rather than panicking on an
-unknown id, consistent with the panic-avoidance approach used throughout
-(see `board.rs`'s `node()`). `standard()` is implemented now, registering
-the movement/movement-modifier cards below under ids 0–5 (`Take 1`–`Take
-4`, `Double`, `Rampage`) — offense/defense/deception cards are added as
-later steps build them.
+**Implementation status.** `CardCatalog::get` returns `Option<&CardMeta>`
+rather than panicking on an unknown id, consistent with the
+panic-avoidance approach used throughout (see `board.rs`'s `node()`).
+`standard()` now registers every card built so far under ids 0–7 (`Take
+1`–`Take 4`, `Double`, `Rampage`, `Shield`, `Stun Trap`) — `offense/` is
+still unpopulated, reserved for a future card that captures without
+moving at all.
 
 ```rust
 // card/movement/move_card.rs
@@ -662,6 +709,19 @@ impl CardBehavior for StunTrapCard {
 }
 ```
 
+**Implementation status.** `StunTrapCard` is exactly as shown above.
+`ShieldCard` matches too, except its `duration` field is typed
+`pawn::ExpiryCondition` directly rather than a separate `ShieldDuration`
+enum: the two had the exact same three variants
+(`Turns(u8)`/`UntilPawnMoves`/`UntilHistoryExpires` vs.
+`AfterTurns(u8)`/`OnPawnMoved`/`WithSourceHistoryItem`), so keeping both
+and converting between them would have been pure ceremony.
+`ShieldCard` also has an `on_claimed` override — not shown above — that
+calls the new `PlayContext::attach_claimed_effect` (§4); nothing in this
+section shows how a claimed Shield's `ClaimedEffectState` ever gets
+attached otherwise. See §4's implementation-status note for that and the
+other `PlayContext`/`InteractionContext` additions this needed.
+
 Shield's exact bookkeeping is genuinely one of the fiddlier pieces here.
 A *claimed* Shield and a *real* Shield need to be tracked separately,
 because they can already anchor differently today — claiming Shield (which
@@ -669,10 +729,9 @@ would attach to the pawn) while actually playing a plain `MoveCard` (which
 attaches nothing at all) is already a mismatch. So a single combined
 "claim+actual" record per attachment doesn't work, even for a single card
 type. Kept as two independent lists on `Pawn` (§8) rather than one, for
-that reason. `ShieldDuration` also needs somewhere to actually live and
-tick down once attached — `PersistentEffectState` (§8) will need an expiry
-field of some kind to enforce it. Both are reasonable starting guesses, not
-final answers, and deliberately left for last in the build order (§16).
+that reason. Both are reasonable starting guesses, not final answers —
+see §4's implementation-status note for the simplifications
+`trigger_automatic_audit` actually landed on.
 
 Two more card ideas are worth flagging as hooks this trait will eventually
 need, without building them out now:
@@ -873,6 +932,28 @@ are moot once it's off the board).
 offered by `legal_actions` at all — the data's there either way; this only
 controls whether it's actively usable as an audit target while parked.
 
+**Additions from §16 step 7**, needed once `ShieldCard`/`StunTrapCard`
+exercised the rest of this section for real:
+- `persistent_effects()`/`claimed_effects()` (read-only slices) and
+  `attach_persistent_effect`/`attach_claimed_effect` (push a new one) —
+  `PlayContext` (§4) needs somewhere to actually store what it attaches.
+- `clear_claimed_effects()` — see `claimed_effects`'s own doc comment
+  above ("resolved... the moment `trigger_automatic_audit` tests them").
+- `MoveRecord::is_a_lie()` — the multiset comparison described just above
+  the original code block, as a method rather than a free function, so
+  both `audit::resolve` (§9) and `InteractionContext::trigger_automatic_audit`
+  (§4) can call it without needing to depend on each other.
+- A `Reversion` struct and `pub fn revert(pawns: &mut [Pawn], topology:
+  &BoardTopology, target_index: usize, move_index: usize,
+  reinstate_captures: bool) -> Reversion` free function — the actual
+  revert-and-reinstate mechanics (calling `revert_from` on the target,
+  then working out and applying which captures get reinstated). Lives
+  here, not in `audit.rs`, for the same reason `AuditOutcome` lives in
+  `card/mod.rs`: `context` (via `trigger_automatic_audit`) needs this same
+  mechanic too, and `context` can't depend on `audit` without a cycle
+  (`card ──> context ──> audit ──> card`, per §1's graph). `audit::resolve`
+  now calls this instead of duplicating the logic itself.
+
 ---
 
 ## 9. Auditing — `audit.rs`
@@ -949,6 +1030,11 @@ deviations from the above:
 - A new `AuditError` (`UnknownPawn`, `UnknownMoveIndex`, `UnknownAuditee`)
   lets the resolution function below report a bad `AuditRequest` as a
   `Result` instead of panicking.
+- The actual revert-and-reinstate mechanics (originally a private helper
+  here) moved to `pawn::revert` (§8, added in step 7) once
+  `context::InteractionContext::trigger_automatic_audit` needed the exact
+  same logic — `resolve` now just calls that and repackages the result as
+  a `RevertOutcome`.
 
 The doc above doesn't show an explicit resolution function — it only
 describes the *behavior* narratively. That behavior lives in

@@ -113,10 +113,10 @@ pub fn resolve(
             index: request.target_move_index,
         })?;
 
-    let outcome = if is_same_multiset(&audited_record.claimed_cards, &audited_record.actual_cards) {
-        AuditOutcome::ClaimWasTrue
-    } else {
+    let outcome = if audited_record.is_a_lie() {
         AuditOutcome::LieCaught
+    } else {
+        AuditOutcome::ClaimWasTrue
     };
 
     let auditee_color = pawns[target_index].owner;
@@ -174,61 +174,22 @@ fn revert_and_reinstate(
     pawns: &mut [Pawn],
     target_index: usize,
 ) -> RevertOutcome {
-    let reverted = pawns[target_index].revert_from(request.target_move_index);
-    let reverted_to = pawns[target_index].position;
-
-    let mut records = reverted.into_iter();
-    let directly_audited = records
-        .next()
-        .expect("resolve() already confirmed a record exists at target_move_index");
-    let directly_audited_cards = directly_audited.actual_cards.clone();
-
-    let mut swept_up_cards = Vec::new();
-    let mut candidates: Vec<(PawnId, SpaceId)> = directly_audited.captures_caused.clone();
-    for record in records {
-        swept_up_cards.extend(record.actual_cards);
-        candidates.extend(record.captures_caused);
-    }
-
-    let reinstated_captures = if rules.revert_captures_on_lie {
-        candidates
-            .into_iter()
-            .filter(|&(captured_id, _)| {
-                pawns.iter().any(|pawn| {
-                    pawn.id == captured_id
-                        && topology.yard_spaces(pawn.owner).contains(&pawn.position)
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
-    for &(captured_id, position) in &reinstated_captures {
-        if let Some(captured) = pawns.iter_mut().find(|pawn| pawn.id == captured_id) {
-            captured.position = position;
-        }
-    }
-
+    let reversion = crate::pawn::revert(
+        pawns,
+        topology,
+        target_index,
+        request.target_move_index,
+        rules.revert_captures_on_lie,
+    );
     RevertOutcome {
         pawn: request.target_pawn,
-        reverted_to,
-        directly_audited_cards,
-        swept_up_cards,
-        reinstated_captures,
+        reverted_to: reversion
+            .reverted_to
+            .expect("resolve() already confirmed a record exists at target_move_index"),
+        directly_audited_cards: reversion.directly_reverted_cards,
+        swept_up_cards: reversion.swept_up_cards,
+        reinstated_captures: reversion.reinstated_captures,
     }
-}
-
-/// Multiset equality on card identities — order doesn't matter.
-fn is_same_multiset(claimed: &[CardKindId], actual: &[CardKindId]) -> bool {
-    if claimed.len() != actual.len() {
-        return false;
-    }
-    let mut claimed_sorted: Vec<u16> = claimed.iter().map(|c| c.0).collect();
-    let mut actual_sorted: Vec<u16> = actual.iter().map(|c| c.0).collect();
-    claimed_sorted.sort_unstable();
-    actual_sorted.sort_unstable();
-    claimed_sorted == actual_sorted
 }
 
 #[cfg(test)]

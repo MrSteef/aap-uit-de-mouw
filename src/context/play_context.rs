@@ -4,10 +4,13 @@
 use std::collections::HashMap;
 
 use crate::board::{BoardTopology, SpaceId};
-use crate::card::CardCatalog;
+use crate::card::{CardCatalog, CardKindId};
+use crate::context::InteractionContext;
 use crate::event::GameEvent;
 use crate::movement::{self, MoveError};
-use crate::pawn::{EffectAnchor, Pawn, PawnId, PersistentEffectState};
+use crate::pawn::{
+    ClaimedEffectState, EffectAnchor, ExpiryCondition, Pawn, PawnId, PersistentEffectState,
+};
 use crate::rules::RuleConfig;
 
 /// How far a capture reaches along a resolved move: only the landing
@@ -49,10 +52,6 @@ pub enum CaptureOutcome {
 /// The context a card's `on_played`/`on_claimed` hooks act through: it can
 /// resolve movement, attempt captures, attach persistent effects, and log
 /// events, but nothing else.
-// `catalog`/`space_effects` aren't read by anything yet — `attempt_capture`/
-// `attach_persistent_effect` are still `todo!()` and will read them once
-// implemented.
-#[allow(dead_code)]
 pub struct PlayContext<'a> {
     topology: &'a BoardTopology,
     rules: &'a RuleConfig,
@@ -60,6 +59,10 @@ pub struct PlayContext<'a> {
     pawns: &'a mut Vec<Pawn>,
     space_effects: &'a mut HashMap<SpaceId, Vec<PersistentEffectState>>,
     mover: PawnId,
+    /// Which card is currently executing `on_played`/`on_claimed` — set by
+    /// `begin_card` before each dispatch, read by `attach_persistent_effect`/
+    /// `attach_claimed_effect` so they know what to attribute the effect to.
+    current_card: Option<CardKindId>,
     events: Vec<GameEvent>,
 }
 
@@ -81,6 +84,7 @@ impl<'a> PlayContext<'a> {
             pawns,
             space_effects,
             mover,
+            current_card: None,
             events: Vec::new(),
         }
     }
@@ -90,17 +94,27 @@ impl<'a> PlayContext<'a> {
         self.mover
     }
 
-    /// Resolves the combined walk described by `proposal` and moves the
-    /// mover there, emitting a `PawnMoved` event. A no-op if
-    /// `proposal.steps == 0`.
-    ///
-    /// Capture dispatch (`attempt_capture` per `proposal.capture_mode`)
-    /// isn't wired in yet — it needs `Pawn`'s real persistent-effect state
-    /// (ARCHITECTURE.md §16, step 6) to have anything meaningful to check.
-    /// Landing on or passing another pawn is currently a no-op.
-    pub fn resolve_movement(&mut self, proposal: MovementProposal) -> Result<(), MoveError> {
+    /// Declares which card is about to have its `on_played`/`on_claimed`
+    /// dispatched — must be called before each such dispatch, since
+    /// `attach_persistent_effect`/`attach_claimed_effect` attribute the
+    /// effect to whichever card was declared most recently.
+    pub fn begin_card(&mut self, card: CardKindId) {
+        self.current_card = Some(card);
+    }
+
+    /// Resolves the combined walk described by `proposal`, moves the mover
+    /// there, emits a `PawnMoved` event, and attempts to capture every
+    /// pawn on a square that qualifies under `proposal.capture_mode`
+    /// (landing square only, or every square passed). Returns what got
+    /// captured, as `(pawn, position)` pairs — the caller uses this to
+    /// build the mover's `MoveRecord.captures_caused`. A no-op (returns an
+    /// empty `Vec`) if `proposal.steps == 0`.
+    pub fn resolve_movement(
+        &mut self,
+        proposal: MovementProposal,
+    ) -> Result<Vec<(PawnId, SpaceId)>, MoveError> {
         if proposal.steps == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // `mover` is always one of `pawns` by construction — `new` is the
         // only way to build a `PlayContext`, and its caller (the not-yet-built
@@ -128,20 +142,152 @@ impl<'a> PlayContext<'a> {
             from,
             to: outcome.final_space,
         });
-        Ok(())
+
+        let squares_to_check: Vec<SpaceId> = match proposal.capture_mode {
+            CaptureMode::LandingSquareOnly => vec![outcome.final_space],
+            CaptureMode::EveryStepPassed => outcome.squares_passed.clone(),
+        };
+
+        let mut captures_caused = Vec::new();
+        for square in squares_to_check {
+            let is_landing = square == outcome.final_space;
+            let targets: Vec<PawnId> = self
+                .pawns
+                .iter()
+                .filter(|pawn| pawn.position == square && pawn.id != self.mover)
+                .map(|pawn| pawn.id)
+                .collect();
+            for target in targets {
+                if self.attempt_capture(target, is_landing) == CaptureOutcome::Proceeds {
+                    captures_caused.push((target, square));
+                    self.emit(GameEvent::PawnCaptured {
+                        pawn: target,
+                        by: self.mover,
+                    });
+                }
+            }
+        }
+
+        Ok(captures_caused)
     }
 
-    /// Attempts to capture `target`, dispatching to its persistent and
-    /// claimed effects. Independently callable by a future card with no
-    /// movement involved at all.
-    pub fn attempt_capture(&mut self, _target: PawnId) -> CaptureOutcome {
-        todo!("needs CardBehavior's capture-attempt hooks, added once context/ is fully wired")
+    /// Attempts to capture `target`, dispatching to its real persistent
+    /// effects (`on_capture_attempted_as_played`) and outstanding claimed
+    /// ones (`on_capture_attempted_as_claimed`) — no priority between the
+    /// two; whichever exist get called. Blocked if any dispatched hook
+    /// says so. `is_landing` is `true` only when `target` sits on the
+    /// move's final square. A no-op (`Proceeds`) if `target` doesn't
+    /// exist. If not blocked and `RuleConfig::capture_sends_to_yard`,
+    /// sends `target` to one of its own yard slots.
+    ///
+    /// Independently callable by a future card with no movement involved
+    /// at all — ARCHITECTURE.md §4 shows this taking only `target`; the
+    /// added `is_landing` parameter is necessary since only the caller
+    /// (here, `resolve_movement`) knows whether this square is the final
+    /// one or a mid-path square under `CaptureMode::EveryStepPassed`.
+    pub fn attempt_capture(&mut self, target: PawnId, is_landing: bool) -> CaptureOutcome {
+        let Some(target_index) = self.pawns.iter().position(|pawn| pawn.id == target) else {
+            return CaptureOutcome::Proceeds;
+        };
+        let persistent = self.pawns[target_index].persistent_effects().to_vec();
+        let claimed = self.pawns[target_index].claimed_effects().to_vec();
+
+        let mut blocked = false;
+        {
+            let mut interaction_ctx = InteractionContext::new(
+                self.mover,
+                target,
+                is_landing,
+                self.topology,
+                self.rules,
+                self.pawns,
+                &mut self.events,
+            );
+            for effect in &persistent {
+                if let Some(meta) = self.catalog.get(effect.source_card)
+                    && meta
+                        .behavior
+                        .on_capture_attempted_as_played(&mut interaction_ctx)
+                        == CaptureOutcome::Blocked
+                {
+                    blocked = true;
+                }
+            }
+            for effect in &claimed {
+                if let Some(meta) = self.catalog.get(effect.source_card)
+                    && meta
+                        .behavior
+                        .on_capture_attempted_as_claimed(&mut interaction_ctx)
+                        == CaptureOutcome::Blocked
+                {
+                    blocked = true;
+                }
+            }
+        }
+
+        if !blocked
+            && self.rules.capture_sends_to_yard
+            && let Some(&yard_slot) = self
+                .topology
+                .yard_spaces(self.pawns[target_index].owner)
+                .first()
+        {
+            self.pawns[target_index].capture_to(yard_slot);
+        }
+
+        if blocked {
+            CaptureOutcome::Blocked
+        } else {
+            CaptureOutcome::Proceeds
+        }
     }
 
-    /// Attaches whichever card is currently executing `on_played` to
-    /// `anchor`.
-    pub fn attach_persistent_effect(&mut self, _anchor: EffectAnchor) {
-        todo!("needs to know which card is currently executing — added alongside concrete cards")
+    /// Attaches a real persistent effect, anchored to `anchor`, for
+    /// whichever card `begin_card` most recently declared.
+    pub fn attach_persistent_effect(
+        &mut self,
+        anchor: EffectAnchor,
+        expires: Option<ExpiryCondition>,
+    ) {
+        let source_card = self.current_card.expect(
+            "attach_persistent_effect called without begin_card — see PlayContext::begin_card",
+        );
+        let effect = PersistentEffectState {
+            source_card,
+            anchor,
+            revealed: false,
+            expires,
+        };
+        match anchor {
+            EffectAnchor::Pawn(id) => {
+                if let Some(pawn) = self.pawns.iter_mut().find(|pawn| pawn.id == id) {
+                    pawn.attach_persistent_effect(effect);
+                }
+            }
+            EffectAnchor::Space(space) => {
+                self.space_effects.entry(space).or_default().push(effect);
+            }
+        }
+    }
+
+    /// Attaches an outstanding claimed effect, anchored to `anchor`, for
+    /// whichever card `begin_card` most recently declared. Only
+    /// `EffectAnchor::Pawn` is meaningful here — `ClaimedEffectState` lives
+    /// on `Pawn` (ARCHITECTURE.md §8), with no space-anchored equivalent;
+    /// a `Space`-anchored claim is silently dropped, since no card claims
+    /// one yet.
+    pub fn attach_claimed_effect(&mut self, anchor: EffectAnchor) {
+        let source_card = self.current_card.expect(
+            "attach_claimed_effect called without begin_card — see PlayContext::begin_card",
+        );
+        if let EffectAnchor::Pawn(id) = anchor
+            && let Some(pawn) = self.pawns.iter_mut().find(|pawn| pawn.id == id)
+        {
+            pawn.attach_claimed_effect(ClaimedEffectState {
+                source_card,
+                anchor,
+            });
+        }
     }
 
     /// Records an event as having happened during this play.
@@ -239,7 +385,8 @@ mod tests {
             multiplier: 1,
             capture_mode: CaptureMode::LandingSquareOnly,
         };
-        ctx.resolve_movement(proposal).unwrap();
+        let captures = ctx.resolve_movement(proposal).unwrap();
+        assert!(captures.is_empty());
 
         assert_eq!(pawns[0].position, {
             let mut expected = start;
@@ -270,7 +417,125 @@ mod tests {
             PawnId(0),
         );
 
-        ctx.resolve_movement(MovementProposal::default()).unwrap();
+        assert!(
+            ctx.resolve_movement(MovementProposal::default())
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(pawns[0].position, start);
+    }
+
+    #[test]
+    fn resolve_movement_captures_a_pawn_on_the_landing_square_and_sends_it_to_yard() {
+        let topology = small_board();
+        let rules = crate::rules::minimal_rules();
+        let catalog = CardCatalog::standard();
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
+        let path_start = pawns[0].position;
+        let landing = {
+            let mut here = path_start;
+            for _ in 0..3 {
+                here = match topology.next_space(here, PlayerColor(0)).unwrap() {
+                    NextSpace::Single(space) => space,
+                    other => panic!("expected a single ring step, got {other:?}"),
+                };
+            }
+            here
+        };
+        pawns.push(crate::pawn::tests::bare_pawn(
+            PawnId(1),
+            PlayerColor(1),
+            landing,
+        ));
+        let mut space_effects = HashMap::new();
+        let mut ctx = PlayContext::new(
+            &topology,
+            &rules,
+            &catalog,
+            &mut pawns,
+            &mut space_effects,
+            PawnId(0),
+        );
+
+        let proposal = MovementProposal {
+            steps: 3,
+            multiplier: 1,
+            capture_mode: CaptureMode::LandingSquareOnly,
+        };
+        let captures = ctx.resolve_movement(proposal).unwrap();
+
+        assert_eq!(captures, vec![(PawnId(1), landing)]);
+        assert_eq!(pawns[0].position, landing);
+        assert_eq!(pawns[1].position, topology.yard_spaces(PlayerColor(1))[0]);
+    }
+
+    #[test]
+    fn attach_persistent_effect_requires_begin_card_first() {
+        let topology = small_board();
+        let rules = crate::rules::minimal_rules();
+        let catalog = CardCatalog::standard();
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
+        let mut space_effects = HashMap::new();
+        let mut ctx = PlayContext::new(
+            &topology,
+            &rules,
+            &catalog,
+            &mut pawns,
+            &mut space_effects,
+            PawnId(0),
+        );
+
+        ctx.begin_card(crate::card::CardKindId(4));
+        ctx.attach_persistent_effect(EffectAnchor::Pawn(PawnId(0)), None);
+
+        assert_eq!(pawns[0].persistent_effects().len(), 1);
+        assert_eq!(
+            pawns[0].persistent_effects()[0].source_card,
+            crate::card::CardKindId(4)
+        );
+    }
+
+    #[test]
+    fn attach_claimed_effect_attaches_to_the_named_pawn() {
+        let topology = small_board();
+        let rules = crate::rules::minimal_rules();
+        let catalog = CardCatalog::standard();
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
+        let mut space_effects = HashMap::new();
+        let mut ctx = PlayContext::new(
+            &topology,
+            &rules,
+            &catalog,
+            &mut pawns,
+            &mut space_effects,
+            PawnId(0),
+        );
+
+        ctx.begin_card(crate::card::CardKindId(4));
+        ctx.attach_claimed_effect(EffectAnchor::Pawn(PawnId(0)));
+
+        assert_eq!(pawns[0].claimed_effects().len(), 1);
+    }
+
+    #[test]
+    fn attempt_capture_on_an_unknown_pawn_proceeds() {
+        let topology = small_board();
+        let rules = crate::rules::minimal_rules();
+        let catalog = CardCatalog::standard();
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
+        let mut space_effects = HashMap::new();
+        let mut ctx = PlayContext::new(
+            &topology,
+            &rules,
+            &catalog,
+            &mut pawns,
+            &mut space_effects,
+            PawnId(0),
+        );
+
+        assert_eq!(
+            ctx.attempt_capture(PawnId(99), true),
+            CaptureOutcome::Proceeds
+        );
     }
 }

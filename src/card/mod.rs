@@ -2,6 +2,8 @@
 //! new type implementing `CardBehavior`, registered in a `CardCatalog`, not
 //! a new branch threaded through the engine.
 
+pub mod deception;
+pub mod defense;
 pub mod movement;
 pub mod movement_modifier;
 
@@ -100,10 +102,13 @@ impl CardCatalog {
         Self { definitions }
     }
 
-    /// The standard catalog. Only the movement/movement-modifier cards
-    /// exist so far (build order §16, step 4) — offense/defense/deception
-    /// cards are added as later steps build them.
+    /// The standard catalog. `offense/` stays unpopulated — reserved for a
+    /// future card that captures without moving at all — but every other
+    /// category now has at least one card.
     pub fn standard() -> Self {
+        use crate::pawn::ExpiryCondition;
+        use deception::StunTrapCard;
+        use defense::ShieldCard;
         use movement::MoveCard;
         use movement_modifier::{DoubleModifierCard, RampageModifierCard};
 
@@ -143,6 +148,20 @@ impl CardCatalog {
                 display_name: "Rampage",
                 category: CardCategory::MovementModifier,
                 behavior: Box::new(RampageModifierCard),
+            },
+            CardMeta {
+                id: CardKindId(6),
+                display_name: "Shield",
+                category: CardCategory::Defense,
+                behavior: Box::new(ShieldCard {
+                    duration: ExpiryCondition::OnPawnMoved,
+                }),
+            },
+            CardMeta {
+                id: CardKindId(7),
+                display_name: "Stun Trap",
+                category: CardCategory::Deception,
+                behavior: Box::new(StunTrapCard),
             },
         ];
         Self { definitions }
@@ -184,6 +203,10 @@ pub(crate) mod tests {
                 self.mover,
             )
         }
+
+        pub(crate) fn pawns(&self) -> &[Pawn] {
+            &self.pawns
+        }
     }
 
     /// A minimal, valid `TestContext`: one pawn, sitting in its own yard,
@@ -213,7 +236,7 @@ pub(crate) mod tests {
     impl CardBehavior for NoOpCard {}
 
     #[test]
-    fn standard_catalog_registers_the_movement_cards() {
+    fn standard_catalog_registers_every_card_built_so_far() {
         let catalog = CardCatalog::standard();
         assert_eq!(
             catalog.get(CardKindId(3)).map(|m| m.display_name),
@@ -227,7 +250,15 @@ pub(crate) mod tests {
             catalog.get(CardKindId(5)).map(|m| m.display_name),
             Some("Rampage")
         );
-        assert!(catalog.get(CardKindId(6)).is_none());
+        assert_eq!(
+            catalog.get(CardKindId(6)).map(|m| m.display_name),
+            Some("Shield")
+        );
+        assert_eq!(
+            catalog.get(CardKindId(7)).map(|m| m.display_name),
+            Some("Stun Trap")
+        );
+        assert!(catalog.get(CardKindId(8)).is_none());
     }
 
     #[test]
