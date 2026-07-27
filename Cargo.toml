@@ -5,10 +5,10 @@ edition = "2024"
 publish = false          # never intended for crates.io — internal to this project
 
 [dependencies]
+thiserror = "2.0.19"  # error enums (GameError, MoveError, BoardError, ...)
 # Add as each module actually needs them, via `cargo add <name>` (not hand-typed
 # versions here — let cargo resolve the current version). Anticipated so far,
 # per ARCHITECTURE.md:
-#   cargo add thiserror   # error enums (GameError, MoveError, ...)
 #   cargo add bon         # RuleConfig builder
 #   cargo add rand        # shuffling / random draws (Deck, SharedPile)
 #
