@@ -6,6 +6,7 @@ publish = false          # never intended for crates.io — internal to this pro
 
 [dependencies]
 bon = "3.9.3"          # RuleConfig builder
+rand = "0.10.2"
 thiserror = "2.0.19"  # error enums (GameError, MoveError, BoardError, ...)
 # Add as each module actually needs them, via `cargo add <name>` (not hand-typed
 # versions here — let cargo resolve the current version). Anticipated so far,

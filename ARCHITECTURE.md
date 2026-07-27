@@ -962,8 +962,17 @@ impl SharedPile {
 }
 ```
 
+**Implementation status.** `Deck`/`SharedPile` are fully implemented (§16
+step 5): both `take` methods draw uniformly at random without replacement
+via `Vec::swap_remove`, sharing one private `take_random` helper. `rand`
+0.10 splits `random_range` onto a separate `RngExt` trait, imported
+alongside `Rng`. Both types also gained an `is_empty()` alongside `len()`
+(clippy's `len_without_is_empty` convention) — not shown above but not a
+behavioral change.
+
 `Player` carries a `deck: Deck` field alongside `hand: Vec<CardKindId>`.
-`GameState` carries a `shared_pile: SharedPile` (§13).
+`GameState` carries a `shared_pile: SharedPile` (§13). `Player` itself
+(§12) is now implemented as shown there — plain data, no methods.
 
 **Full lifecycle of a card:**
 
