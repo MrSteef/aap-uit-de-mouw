@@ -14,6 +14,21 @@ pub struct AuditContext<'a> {
 }
 
 impl<'a> AuditContext<'a> {
+    /// Builds a context for one audit's card-behavior dispatch.
+    pub fn new(
+        auditor: PlayerId,
+        auditee: PlayerId,
+        target_pawn: PawnId,
+        forfeit_auditor_turn: &'a mut bool,
+    ) -> Self {
+        Self {
+            auditor,
+            auditee,
+            target_pawn,
+            forfeit_auditor_turn,
+        }
+    }
+
     /// Marks that the auditor's turn is forfeited, independent of whether
     /// the audit itself caught a lie.
     pub fn forfeit_auditor_turn(&mut self) {

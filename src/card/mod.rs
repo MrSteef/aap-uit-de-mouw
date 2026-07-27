@@ -5,7 +5,9 @@
 pub mod movement;
 pub mod movement_modifier;
 
-use crate::context::{CaptureOutcome, InteractionContext, MovementProposal, PlayContext};
+use crate::context::{
+    AuditContext, CaptureOutcome, InteractionContext, MovementProposal, PlayContext,
+};
 
 /// Identifies one kind of card in a `CardCatalog`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -21,11 +23,21 @@ pub enum CardCategory {
     Deception,
 }
 
-/// The behavior a card kind implements.
+/// Whether an audited move's claim matched what was truly played.
 ///
-/// `on_audited_as_played`/`on_audited_as_claimed` (ARCHITECTURE.md §5)
-/// aren't defined yet: they take an `AuditOutcome`, which doesn't exist
-/// until `audit.rs` lands (build order §16, step 6). Added then.
+/// Defined here rather than in `audit.rs` (where ARCHITECTURE.md §9 shows
+/// it) because `CardBehavior`'s audit hooks below need it, and `audit ──>
+/// card` per §1's dependency graph — `card` must not depend on `audit`.
+/// This mirrors why `EffectAnchor` lives in `pawn.rs` instead of
+/// `context/`: the type moves to whichever module is lower in the
+/// dependency graph among the ones that need it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuditOutcome {
+    LieCaught,
+    ClaimWasTrue,
+}
+
+/// The behavior a card kind implements.
 pub trait CardBehavior {
     /// Fires the instant this card is *actually* consumed from hand.
     fn on_played(&self, _ctx: &mut PlayContext) {}
@@ -49,6 +61,13 @@ pub trait CardBehavior {
     fn on_capture_attempted_as_claimed(&self, _ctx: &mut InteractionContext) -> CaptureOutcome {
         CaptureOutcome::Proceeds
     }
+
+    /// Fires when an audit resolves, dispatched against the *actually
+    /// played* card in the audited move — independent of `outcome`, so it
+    /// can fire even when the accusation was wrong (see `StunTrapCard`).
+    fn on_audited_as_played(&self, _outcome: AuditOutcome, _ctx: &mut AuditContext) {}
+    /// As above, but for the *claimed* card in the audited move.
+    fn on_audited_as_claimed(&self, _outcome: AuditOutcome, _ctx: &mut AuditContext) {}
 }
 
 /// One card kind's catalog entry: its identity, display info, and behavior.
@@ -70,6 +89,15 @@ impl CardCatalog {
     /// under that id.
     pub fn get(&self, id: CardKindId) -> Option<&CardMeta> {
         self.definitions.get(id.0 as usize)
+    }
+
+    /// Builds a catalog from arbitrary entries — used by other modules'
+    /// tests that need a `CardBehavior` `standard()` doesn't register yet
+    /// (e.g. simulating `StunTrapCard` before it exists, in `audit.rs`'s
+    /// tests).
+    #[cfg(test)]
+    pub(crate) fn from_definitions(definitions: Vec<CardMeta>) -> Self {
+        Self { definitions }
     }
 
     /// The standard catalog. Only the movement/movement-modifier cards
@@ -166,11 +194,11 @@ pub(crate) mod tests {
         let rules = crate::rules::minimal_rules();
         let catalog = CardCatalog::standard();
         let mover = PawnId(0);
-        let pawns = vec![Pawn {
-            id: mover,
-            owner: PlayerColor(0),
-            position: topology.yard_spaces(PlayerColor(0))[0],
-        }];
+        let pawns = vec![crate::pawn::tests::bare_pawn(
+            mover,
+            PlayerColor(0),
+            topology.yard_spaces(PlayerColor(0))[0],
+        )];
         TestContext {
             topology,
             rules,

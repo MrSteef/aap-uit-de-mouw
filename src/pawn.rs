@@ -1,8 +1,17 @@
-//! Pawn identity and position, plus the persistent-effect bookkeeping that
-//! anchors to a pawn or a space. The full struct from ARCHITECTURE.md §8
-//! (move history, captured-pawn bookkeeping) lands when the build order
-//! (§16) reaches step 6; for now this only carries what `movement.rs` and
-//! `context/` need.
+//! Pawn identity, position, persistent-effect bookkeeping, and the move
+//! history that makes both auditing and reinstatement possible.
+//!
+//! A pawn's history persists until it next leaves the yard — capture only
+//! clears `position` and the persistent/claimed effect lists, never
+//! `history` itself. That's what makes "reinstate with history intact"
+//! possible at all. No separate field remembers a pre-capture position:
+//! it's already sitting in the *capturing* pawn's own `MoveRecord`
+//! (`captures_caused`), and it's only ever needed while that record is
+//! still within the capturing pawn's own audit window anyway. Cards tied
+//! up in a captured pawn remain tied up in it until it either leaves the
+//! yard or the owner manually reclaims them, forfeiting reinstatement.
+
+use std::collections::VecDeque;
 
 use crate::board::{PlayerColor, SpaceId};
 use crate::card::CardKindId;
@@ -11,12 +20,22 @@ use crate::card::CardKindId;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PawnId(pub u32);
 
-/// A pawn's identity, owner, and current position.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// A pawn's identity, owner, position, active effects, and recent move
+/// history.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Pawn {
     pub id: PawnId,
     pub owner: PlayerColor,
     pub position: SpaceId,
+    persistent_effects: Vec<PersistentEffectState>,
+    /// Outstanding *claims* of a persistent effect, tracked separately from
+    /// real ones — see the anchor-mismatch note in ARCHITECTURE.md §5.
+    /// Resolved (removed) the moment `trigger_automatic_audit` tests them,
+    /// one way or another.
+    claimed_effects: Vec<ClaimedEffectState>,
+    /// Capacity is bounded to `RuleConfig::audit_window` by whoever calls
+    /// `push_move`, not enforced internally by this type.
+    history: VecDeque<MoveRecord>,
 }
 
 /// Anchors a persistent effect to a pawn (follows it wherever it goes) or a
@@ -47,4 +66,242 @@ pub enum ExpiryCondition {
     AfterTurns(u8),
     OnPawnMoved,
     WithSourceHistoryItem,
+}
+
+/// An outstanding *claim* of a persistent effect, with no real effect
+/// backing it (or not yet known to).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClaimedEffectState {
+    pub source_card: CardKindId,
+    pub anchor: EffectAnchor,
+}
+
+/// One resolved move: what was claimed, what really happened, and what it
+/// did.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct MoveRecord {
+    pub claimed_cards: Vec<CardKindId>,
+    pub actual_cards: Vec<CardKindId>,
+    pub position_before: SpaceId,
+    pub position_after: SpaceId,
+    pub captures_caused: Vec<(PawnId, SpaceId)>,
+    pub reveal: RevealScope,
+}
+
+/// Only meaningful for records that *stay* in history — a move proven true
+/// by a failed accusation. A caught lie's records leave history entirely
+/// for the auditor's hand, so there's nothing left here to track
+/// visibility for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RevealScope {
+    Hidden,
+    Public,
+}
+
+impl Pawn {
+    /// Pushes `record` onto this pawn's history. If that leaves more than
+    /// `window` records, the oldest one ages out and is returned — its
+    /// cards are the caller's responsibility to route back to the owner's
+    /// reserve (ARCHITECTURE.md §10). `None` if nothing aged out.
+    pub fn push_move(&mut self, record: MoveRecord, window: usize) -> Option<MoveRecord> {
+        self.history.push_back(record);
+        if self.history.len() > window {
+            self.history.pop_front()
+        } else {
+            None
+        }
+    }
+
+    /// Every move still within this pawn's audit window, oldest first,
+    /// paired with the index `revert_from` would need to undo it.
+    pub fn auditable_moves(&self) -> impl Iterator<Item = (usize, &MoveRecord)> {
+        self.history.iter().enumerate()
+    }
+
+    /// Marks the move at `index` as provenly honest — a failed accusation
+    /// leaves it in history, now publicly known to be true. A no-op if
+    /// `index` is out of range.
+    pub fn mark_move_public(&mut self, index: usize) {
+        if let Some(record) = self.history.get_mut(index) {
+            record.reveal = RevealScope::Public;
+        }
+    }
+
+    /// Clears `persistent_effects` and `claimed_effects`, moves `position`
+    /// to `yard_slot`. Deliberately does *not* touch `history` — those
+    /// records' cards stay attached and dormant until one of the two paths
+    /// below.
+    pub fn capture_to(&mut self, yard_slot: SpaceId) {
+        self.persistent_effects.clear();
+        self.claimed_effects.clear();
+        self.position = yard_slot;
+    }
+
+    /// Called when this pawn's first move *out* of the yard resolves.
+    /// Every still-attached record is treated exactly like a natural
+    /// age-out at this point — returns their cards for the caller to send
+    /// to the owner's reserve (ARCHITECTURE.md §10).
+    pub fn clear_history_on_exit(&mut self) -> Vec<CardKindId> {
+        self.drain_history_cards()
+    }
+
+    /// The early-cashout alternative to waiting for `clear_history_on_exit`:
+    /// the owner may collect a captured pawn's attached cards straight to
+    /// hand now, at the cost of losing that pawn's reinstatement
+    /// eligibility — there's nothing left to revert it to afterward.
+    pub fn collect_early_forfeiting_reinstatement(&mut self) -> Vec<CardKindId> {
+        self.drain_history_cards()
+    }
+
+    fn drain_history_cards(&mut self) -> Vec<CardKindId> {
+        self.history
+            .drain(..)
+            .flat_map(|record| record.actual_cards)
+            .collect()
+    }
+
+    /// Reverts this pawn to its position just before the move at `index`,
+    /// discarding that move and everything after it. Returns the discarded
+    /// records, oldest (the directly-audited one) first — the caller uses
+    /// them to distribute cards and reinstate captures.
+    ///
+    /// `index >= self.history.len()` is treated as nothing to revert
+    /// (returns an empty `Vec`) rather than panicking — `audit.rs` already
+    /// validates the index before calling this, but `Pawn` is a public
+    /// type and shouldn't trust an out-of-range index from any caller.
+    pub fn revert_from(&mut self, index: usize) -> Vec<MoveRecord> {
+        if index >= self.history.len() {
+            return Vec::new();
+        }
+        let reverted: Vec<MoveRecord> = self.history.split_off(index).into();
+        if let Some(first) = reverted.first() {
+            self.position = first.position_before;
+        }
+        reverted
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    pub(crate) fn bare_pawn(id: PawnId, owner: PlayerColor, position: SpaceId) -> Pawn {
+        Pawn {
+            id,
+            owner,
+            position,
+            persistent_effects: Vec::new(),
+            claimed_effects: Vec::new(),
+            history: VecDeque::new(),
+        }
+    }
+
+    fn record(claimed: Vec<u16>, actual: Vec<u16>, before: u32, after: u32) -> MoveRecord {
+        MoveRecord {
+            claimed_cards: claimed.into_iter().map(CardKindId).collect(),
+            actual_cards: actual.into_iter().map(CardKindId).collect(),
+            position_before: SpaceId(before),
+            position_after: SpaceId(after),
+            captures_caused: Vec::new(),
+            reveal: RevealScope::Hidden,
+        }
+    }
+
+    #[test]
+    fn push_move_keeps_everything_within_the_window() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        assert_eq!(pawn.push_move(record(vec![1], vec![1], 0, 1), 3), None);
+        assert_eq!(pawn.push_move(record(vec![2], vec![2], 1, 2), 3), None);
+        assert_eq!(pawn.auditable_moves().count(), 2);
+    }
+
+    #[test]
+    fn push_move_ages_out_the_oldest_record_past_the_window() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        let first = record(vec![1], vec![1], 0, 1);
+        assert_eq!(pawn.push_move(first.clone(), 1), None);
+        let aged_out = pawn.push_move(record(vec![2], vec![2], 1, 2), 1);
+        assert_eq!(aged_out, Some(first));
+        assert_eq!(pawn.auditable_moves().count(), 1);
+    }
+
+    #[test]
+    fn auditable_moves_reports_oldest_first_with_matching_indices() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        pawn.push_move(record(vec![1], vec![1], 0, 1), 5);
+        pawn.push_move(record(vec![2], vec![2], 1, 2), 5);
+        let indices: Vec<usize> = pawn.auditable_moves().map(|(i, _)| i).collect();
+        assert_eq!(indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn capture_to_clears_effects_and_moves_but_keeps_history() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(5));
+        pawn.push_move(record(vec![1], vec![1], 0, 5), 5);
+        pawn.persistent_effects.push(PersistentEffectState {
+            source_card: CardKindId(9),
+            anchor: EffectAnchor::Pawn(PawnId(0)),
+            revealed: false,
+            expires: None,
+        });
+        pawn.claimed_effects.push(ClaimedEffectState {
+            source_card: CardKindId(9),
+            anchor: EffectAnchor::Pawn(PawnId(0)),
+        });
+
+        pawn.capture_to(SpaceId(0));
+
+        assert_eq!(pawn.position, SpaceId(0));
+        assert!(pawn.persistent_effects.is_empty());
+        assert!(pawn.claimed_effects.is_empty());
+        assert_eq!(pawn.auditable_moves().count(), 1);
+    }
+
+    #[test]
+    fn clear_history_on_exit_drains_history_and_returns_actual_cards() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        pawn.push_move(record(vec![1], vec![2, 3], 0, 1), 5);
+        pawn.push_move(record(vec![4], vec![5], 1, 2), 5);
+
+        let mut cards = pawn.clear_history_on_exit();
+        cards.sort_by_key(|c| c.0);
+        assert_eq!(cards, vec![CardKindId(2), CardKindId(3), CardKindId(5)]);
+        assert_eq!(pawn.auditable_moves().count(), 0);
+    }
+
+    #[test]
+    fn collect_early_forfeiting_reinstatement_also_drains_history() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        pawn.push_move(record(vec![1], vec![7], 0, 1), 5);
+        assert_eq!(
+            pawn.collect_early_forfeiting_reinstatement(),
+            vec![CardKindId(7)]
+        );
+        assert_eq!(pawn.auditable_moves().count(), 0);
+    }
+
+    #[test]
+    fn revert_from_discards_the_move_and_everything_after_it() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(3));
+        pawn.push_move(record(vec![1], vec![1], 0, 1), 5);
+        pawn.push_move(record(vec![2], vec![2], 1, 2), 5);
+        pawn.push_move(record(vec![3], vec![3], 2, 3), 5);
+
+        let reverted = pawn.revert_from(1);
+
+        assert_eq!(reverted.len(), 2);
+        assert_eq!(reverted[0].position_before, SpaceId(1));
+        assert_eq!(reverted[1].position_before, SpaceId(2));
+        assert_eq!(pawn.position, SpaceId(1));
+        assert_eq!(pawn.auditable_moves().count(), 1);
+    }
+
+    #[test]
+    fn revert_from_out_of_range_reverts_nothing() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(3));
+        pawn.push_move(record(vec![1], vec![1], 0, 1), 5);
+        assert_eq!(pawn.revert_from(5), Vec::new());
+        assert_eq!(pawn.position, SpaceId(3));
+        assert_eq!(pawn.auditable_moves().count(), 1);
+    }
 }

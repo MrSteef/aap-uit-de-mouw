@@ -87,7 +87,7 @@ fn is_blockaded(pawns: &[Pawn], space: SpaceId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pawn::{Pawn, PawnId};
+    use crate::pawn::PawnId;
 
     const RING_LEN: u16 = 8;
     const HOME_LANE_LEN: u16 = 3;
@@ -168,16 +168,8 @@ mod tests {
         let entry = entry_of(&board, PlayerColor(0));
         let path = manual_steps(&board, PlayerColor(0), entry, 3);
         let pawns = vec![
-            Pawn {
-                id: PawnId(0),
-                owner: PlayerColor(1),
-                position: path[1],
-            },
-            Pawn {
-                id: PawnId(1),
-                owner: PlayerColor(1),
-                position: path[1],
-            },
+            crate::pawn::tests::bare_pawn(PawnId(0), PlayerColor(1), path[1]),
+            crate::pawn::tests::bare_pawn(PawnId(1), PlayerColor(1), path[1]),
         ];
         assert_eq!(
             walk(&board, &rules, &pawns, PlayerColor(0), entry, 3).unwrap_err(),
@@ -192,16 +184,8 @@ mod tests {
         let entry = entry_of(&board, PlayerColor(0));
         let path = manual_steps(&board, PlayerColor(0), entry, 3);
         let pawns = vec![
-            Pawn {
-                id: PawnId(0),
-                owner: PlayerColor(1),
-                position: path[1],
-            },
-            Pawn {
-                id: PawnId(1),
-                owner: PlayerColor(1),
-                position: path[1],
-            },
+            crate::pawn::tests::bare_pawn(PawnId(0), PlayerColor(1), path[1]),
+            crate::pawn::tests::bare_pawn(PawnId(1), PlayerColor(1), path[1]),
         ];
         let outcome = walk(&board, &rules, &pawns, PlayerColor(0), entry, 3).unwrap();
         assert_eq!(outcome.final_space, path[2]);
@@ -213,11 +197,11 @@ mod tests {
         let rules = test_rules(true, false);
         let entry = entry_of(&board, PlayerColor(0));
         let path = manual_steps(&board, PlayerColor(0), entry, 3);
-        let pawns = vec![Pawn {
-            id: PawnId(0),
-            owner: PlayerColor(1),
-            position: path[1],
-        }];
+        let pawns = vec![crate::pawn::tests::bare_pawn(
+            PawnId(0),
+            PlayerColor(1),
+            path[1],
+        )];
         let outcome = walk(&board, &rules, &pawns, PlayerColor(0), entry, 3).unwrap();
         assert_eq!(outcome.final_space, path[2]);
     }
