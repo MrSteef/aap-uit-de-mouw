@@ -499,6 +499,18 @@ impl<'a> AuditContext<'a> {
 }
 ```
 
+**Implementation status.** `EffectAnchor` (shown above under `PlayContext`) actually
+lives in `pawn.rs` instead: `PersistentEffectState` (§8) needs it, and this
+section's own dependency graph (§1) has `context` depend on `pawn`, never the
+reverse — defining it here would create a cycle. `resolve_movement` returns
+`Result<(), MoveError>` rather than `()`, since `movement::walk` (§6) can
+fail and that needs to surface as a `Result`, not a panic. `PlayContext` also
+has a `new(...)` constructor (all its fields are private) that isn't shown
+above. `resolve_movement`'s capture dispatch isn't wired up yet — it moves
+the mover and emits `PawnMoved`, but doesn't call `attempt_capture` for
+touched squares yet, since `attempt_capture` itself is still `todo!()` until
+Pawn's real persistent-effect state and Shield exist (§16 steps 6–7).
+
 ---
 
 ## 5. Cards — `card/`
@@ -556,6 +568,16 @@ impl CardCatalog {
     pub fn standard() -> Self { todo!() }
 }
 ```
+
+**Implementation status.** `on_audited_as_played`/`on_audited_as_claimed`
+aren't defined on `CardBehavior` yet — they take an `AuditOutcome`, which
+doesn't exist until `audit.rs` lands (§16 step 6); they're added then.
+`CardCatalog::get` returns `Option<&CardMeta>` rather than panicking on an
+unknown id, consistent with the panic-avoidance approach used throughout
+(see `board.rs`'s `node()`). `standard()` is implemented now, registering
+the movement/movement-modifier cards below under ids 0–5 (`Take 1`–`Take
+4`, `Double`, `Rampage`) — offense/defense/deception cards are added as
+later steps build them.
 
 ```rust
 // card/movement/move_card.rs
@@ -682,6 +704,17 @@ pub fn walk(
 ) -> Result<MovementOutcome, MoveError> { todo!() }
 ```
 
+**Implementation status.** Fully implemented (§16 step 3), including
+blockade checks (two or more of the same color stacked on a space blocks
+everyone, when `rules.blockades_enabled`) and the finish-line rule
+(`rules.exact_count_to_finish`). `MoveError` gained a fifth variant,
+`InvalidBoard(#[from] BoardError)`, so an unknown `SpaceId` propagates as a
+`Result` instead of panicking, consistent with `board.rs`'s own
+panic-avoidance fix. Reaching the per-color home-lane fork (the one place
+`next_space` returns a real `Branch`) yields `MoveError::UnresolvedBranch`
+— there's no branch-resolution mechanism yet, so a pawn can't cross its own
+fork via `walk` alone.
+
 ---
 
 ## 7. The claim/actual split — `play.rs`
@@ -767,7 +800,29 @@ pub struct MoveRecord {
 /// visibility for; `VisibleTo(...)`-style partial visibility was
 /// considered and dropped for exactly that reason.
 pub enum RevealScope { Hidden, Public }
+```
 
+**Implementation status.** Only a minimal slice of this section exists so
+far (§16 steps 3–4, ahead of this module's own step 6): `PawnId`, a
+minimal `Pawn` (just `id`/`owner`/`position` — no `persistent_effects`,
+`claimed_effects`, or `history` fields yet), `EffectAnchor`,
+`PersistentEffectState`, and `ExpiryCondition`. `ClaimedEffectState`,
+`MoveRecord`, `RevealScope`, and all of `impl Pawn` below are still
+exactly as shown here — not yet built.
+
+`Pawn.owner` is `PlayerColor` here, not `PlayerId` as shown above:
+`movement::walk`'s blockade check needs to know which *board color* owns
+each pawn, and it only takes a bare `pawns: &[Pawn]` slice with no
+accompanying `Player` list to resolve `PlayerId` → color. Worth revisiting
+once `player.rs`/this module get their full build-out: `Pawn` may need to
+carry both `PlayerId` (economic ownership) and something color-resolvable,
+or `PlayerId`/`PlayerColor` may turn out to always be interchangeable by
+convention (one color per player, fixed at setup).
+
+`EffectAnchor` is defined here rather than in `context/play_context.rs` as
+§4 shows it — see that section's implementation-status note.
+
+```rust
 impl Pawn {
     pub fn push_move(&mut self, record: MoveRecord, window: usize) { todo!() }
     pub fn auditable_moves(&self) -> impl Iterator<Item = (usize, &MoveRecord)> { todo!() }

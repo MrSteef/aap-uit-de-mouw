@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use crate::board::{BoardTopology, SpaceId};
 use crate::card::CardCatalog;
 use crate::event::GameEvent;
+use crate::movement::{self, MoveError};
 use crate::pawn::{EffectAnchor, Pawn, PawnId, PersistentEffectState};
 use crate::rules::RuleConfig;
 
@@ -48,8 +49,7 @@ pub enum CaptureOutcome {
 /// The context a card's `on_played`/`on_claimed` hooks act through: it can
 /// resolve movement, attempt captures, attach persistent effects, and log
 /// events, but nothing else.
-// `topology`/`rules`/`catalog`/`pawns`/`space_effects` aren't read by
-// anything yet — `resolve_movement`/`attempt_capture`/
+// `catalog`/`space_effects` aren't read by anything yet — `attempt_capture`/
 // `attach_persistent_effect` are still `todo!()` and will read them once
 // implemented.
 #[allow(dead_code)]
@@ -64,16 +64,71 @@ pub struct PlayContext<'a> {
 }
 
 impl<'a> PlayContext<'a> {
+    /// Builds a context for `mover`'s play, borrowing everything it needs
+    /// from live game state.
+    pub fn new(
+        topology: &'a BoardTopology,
+        rules: &'a RuleConfig,
+        catalog: &'a CardCatalog,
+        pawns: &'a mut Vec<Pawn>,
+        space_effects: &'a mut HashMap<SpaceId, Vec<PersistentEffectState>>,
+        mover: PawnId,
+    ) -> Self {
+        Self {
+            topology,
+            rules,
+            catalog,
+            pawns,
+            space_effects,
+            mover,
+            events: Vec::new(),
+        }
+    }
+
     /// The pawn this play is moving.
     pub fn mover(&self) -> PawnId {
         self.mover
     }
 
-    /// Resolves the combined walk described by `proposal`, capturing every
-    /// square touched that qualifies under its `capture_mode`. A no-op if
+    /// Resolves the combined walk described by `proposal` and moves the
+    /// mover there, emitting a `PawnMoved` event. A no-op if
     /// `proposal.steps == 0`.
-    pub fn resolve_movement(&mut self, _proposal: MovementProposal) {
-        todo!("wired up once movement.rs's walk() is driven from here — see ARCHITECTURE.md §4")
+    ///
+    /// Capture dispatch (`attempt_capture` per `proposal.capture_mode`)
+    /// isn't wired in yet — it needs `Pawn`'s real persistent-effect state
+    /// (ARCHITECTURE.md §16, step 6) to have anything meaningful to check.
+    /// Landing on or passing another pawn is currently a no-op.
+    pub fn resolve_movement(&mut self, proposal: MovementProposal) -> Result<(), MoveError> {
+        if proposal.steps == 0 {
+            return Ok(());
+        }
+        // `mover` is always one of `pawns` by construction — `new` is the
+        // only way to build a `PlayContext`, and its caller (the not-yet-built
+        // game engine) always derives `mover` from that same pawn list.
+        let index = self
+            .pawns
+            .iter()
+            .position(|pawn| pawn.id == self.mover)
+            .expect("PlayContext::mover must be one of PlayContext::pawns");
+        let owner = self.pawns[index].owner;
+        let from = self.pawns[index].position;
+        let total_steps = proposal.steps.saturating_mul(proposal.multiplier);
+
+        let outcome = movement::walk(
+            self.topology,
+            self.rules,
+            self.pawns,
+            owner,
+            from,
+            total_steps,
+        )?;
+        self.pawns[index].position = outcome.final_space;
+        self.emit(GameEvent::PawnMoved {
+            pawn: self.mover,
+            from,
+            to: outcome.final_space,
+        });
+        Ok(())
     }
 
     /// Attempts to capture `target`, dispatching to its persistent and
@@ -98,25 +153,23 @@ impl<'a> PlayContext<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::board::PlayerColor;
+    use crate::board::{NextSpace, PlayerColor};
 
-    fn play_context<'a>(
-        topology: &'a BoardTopology,
-        rules: &'a RuleConfig,
-        catalog: &'a CardCatalog,
-        pawns: &'a mut Vec<Pawn>,
-        space_effects: &'a mut HashMap<SpaceId, Vec<PersistentEffectState>>,
-        mover: PawnId,
-    ) -> PlayContext<'a> {
-        PlayContext {
-            topology,
-            rules,
-            catalog,
-            pawns,
-            space_effects,
-            mover,
-            events: Vec::new(),
-        }
+    fn small_board() -> BoardTopology {
+        BoardTopology::standard_ring(2, 8, 3, 2).unwrap()
+    }
+
+    fn one_pawn_at(topology: &BoardTopology, color: PlayerColor) -> Vec<Pawn> {
+        let yard = topology.yard_spaces(color)[0];
+        let entry = match topology.next_space(yard, color).unwrap() {
+            NextSpace::Single(space) => space,
+            other => panic!("expected a single yard exit edge, got {other:?}"),
+        };
+        vec![Pawn {
+            id: PawnId(0),
+            owner: color,
+            position: entry,
+        }]
     }
 
     #[test]
@@ -129,16 +182,12 @@ mod tests {
 
     #[test]
     fn mover_reports_the_pawn_this_context_was_built_for() {
-        let topology = BoardTopology::standard_ring(2, 8, 3, 2).unwrap();
+        let topology = small_board();
         let rules = crate::rules::minimal_rules();
         let catalog = CardCatalog::standard();
-        let mut pawns = vec![Pawn {
-            id: PawnId(0),
-            owner: PlayerColor(0),
-            position: SpaceId(0),
-        }];
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
         let mut space_effects = HashMap::new();
-        let ctx = play_context(
+        let ctx = PlayContext::new(
             &topology,
             &rules,
             &catalog,
@@ -151,16 +200,12 @@ mod tests {
 
     #[test]
     fn emit_records_the_event() {
-        let topology = BoardTopology::standard_ring(2, 8, 3, 2).unwrap();
+        let topology = small_board();
         let rules = crate::rules::minimal_rules();
         let catalog = CardCatalog::standard();
-        let mut pawns = vec![Pawn {
-            id: PawnId(0),
-            owner: PlayerColor(0),
-            position: SpaceId(0),
-        }];
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
         let mut space_effects = HashMap::new();
-        let mut ctx = play_context(
+        let mut ctx = PlayContext::new(
             &topology,
             &rules,
             &catalog,
@@ -174,5 +219,62 @@ mod tests {
             to: SpaceId(1),
         });
         assert_eq!(ctx.events.len(), 1);
+    }
+
+    #[test]
+    fn resolve_movement_walks_the_mover_and_emits_pawn_moved() {
+        let topology = small_board();
+        let rules = crate::rules::minimal_rules();
+        let catalog = CardCatalog::standard();
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
+        let start = pawns[0].position;
+        let mut space_effects = HashMap::new();
+        let mut ctx = PlayContext::new(
+            &topology,
+            &rules,
+            &catalog,
+            &mut pawns,
+            &mut space_effects,
+            PawnId(0),
+        );
+
+        let proposal = MovementProposal {
+            steps: 3,
+            multiplier: 1,
+            capture_mode: CaptureMode::LandingSquareOnly,
+        };
+        ctx.resolve_movement(proposal).unwrap();
+
+        assert_eq!(pawns[0].position, {
+            let mut expected = start;
+            for _ in 0..3 {
+                expected = match topology.next_space(expected, PlayerColor(0)).unwrap() {
+                    NextSpace::Single(space) => space,
+                    other => panic!("expected a single ring step, got {other:?}"),
+                };
+            }
+            expected
+        });
+    }
+
+    #[test]
+    fn resolve_movement_is_a_no_op_for_zero_steps() {
+        let topology = small_board();
+        let rules = crate::rules::minimal_rules();
+        let catalog = CardCatalog::standard();
+        let mut pawns = one_pawn_at(&topology, PlayerColor(0));
+        let start = pawns[0].position;
+        let mut space_effects = HashMap::new();
+        let mut ctx = PlayContext::new(
+            &topology,
+            &rules,
+            &catalog,
+            &mut pawns,
+            &mut space_effects,
+            PawnId(0),
+        );
+
+        ctx.resolve_movement(MovementProposal::default()).unwrap();
+        assert_eq!(pawns[0].position, start);
     }
 }
