@@ -13,7 +13,7 @@
 
 use std::collections::VecDeque;
 
-use crate::board::{PlayerColor, SpaceId};
+use crate::board::{BoardTopology, PlayerColor, SpaceId};
 use crate::card::CardKindId;
 
 /// Identifies a single pawn.
@@ -98,6 +98,22 @@ pub enum RevealScope {
     Public,
 }
 
+impl MoveRecord {
+    /// Whether `claimed_cards` and `actual_cards` differ as multisets —
+    /// order doesn't matter, so claiming `[Take4, Double]` but having
+    /// played `[Double, Take1]` is not a lie.
+    pub fn is_a_lie(&self) -> bool {
+        if self.claimed_cards.len() != self.actual_cards.len() {
+            return true;
+        }
+        let mut claimed: Vec<u16> = self.claimed_cards.iter().map(|c| c.0).collect();
+        let mut actual: Vec<u16> = self.actual_cards.iter().map(|c| c.0).collect();
+        claimed.sort_unstable();
+        actual.sort_unstable();
+        claimed != actual
+    }
+}
+
 impl Pawn {
     /// Pushes `record` onto this pawn's history. If that leaves more than
     /// `window` records, the oldest one ages out and is returned — its
@@ -125,6 +141,36 @@ impl Pawn {
         if let Some(record) = self.history.get_mut(index) {
             record.reveal = RevealScope::Public;
         }
+    }
+
+    /// The real, currently-active persistent effects on this pawn.
+    pub fn persistent_effects(&self) -> &[PersistentEffectState] {
+        &self.persistent_effects
+    }
+
+    /// The outstanding claimed effects on this pawn.
+    pub fn claimed_effects(&self) -> &[ClaimedEffectState] {
+        &self.claimed_effects
+    }
+
+    /// Attaches a real persistent effect to this pawn.
+    pub fn attach_persistent_effect(&mut self, effect: PersistentEffectState) {
+        self.persistent_effects.push(effect);
+    }
+
+    /// Attaches an outstanding claimed effect to this pawn.
+    pub fn attach_claimed_effect(&mut self, effect: ClaimedEffectState) {
+        self.claimed_effects.push(effect);
+    }
+
+    /// Resolves every outstanding claimed effect on this pawn — called once
+    /// `trigger_automatic_audit` has tested them, one way or another (see
+    /// the field doc on `claimed_effects`). Simplification: clears *all*
+    /// claimed effects rather than just the one actually tested, since
+    /// nothing here tracks which specific claim a given automatic-audit
+    /// check was about.
+    pub fn clear_claimed_effects(&mut self) {
+        self.claimed_effects.clear();
     }
 
     /// Clears `persistent_effects` and `claimed_effects`, moves `position`
@@ -178,6 +224,83 @@ impl Pawn {
             self.position = first.position_before;
         }
         reverted
+    }
+}
+
+/// The mechanical result of reverting a pawn to just before one of its
+/// moves: what cards come loose, and which captures (if any) get
+/// reinstated.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Reversion {
+    pub reverted_to: Option<SpaceId>,
+    /// The directly reverted move's own actual cards.
+    pub directly_reverted_cards: Vec<CardKindId>,
+    /// Actual cards from the newer moves swept up along with it.
+    pub swept_up_cards: Vec<CardKindId>,
+    pub reinstated_captures: Vec<(PawnId, SpaceId)>,
+}
+
+/// Reverts `pawns[target_index]` to just before the move at `move_index`,
+/// discarding it and everything after, and — if `reinstate_captures` —
+/// reinstating any pawns it captured along the way that haven't since
+/// moved under their own power (checked via whether a captured pawn's
+/// *current* position is still one of its own `topology.yard_spaces`).
+///
+/// Shared by `audit::resolve` (a deliberate audit) and
+/// `context::InteractionContext::trigger_automatic_audit` (an automatic
+/// check, e.g. a bluffed Shield) — both need the exact same mechanical
+/// revert, just with different things happening around it (card-economy
+/// routing, forfeit dispatch). Lives here rather than in `audit.rs`
+/// because `context` (which needs it too) can't depend on `audit` without
+/// a cycle (`card ──> context ──> audit ──> card`, per §1's dependency
+/// graph) — the same fix as `EffectAnchor`/`AuditOutcome` before it.
+pub fn revert(
+    pawns: &mut [Pawn],
+    topology: &BoardTopology,
+    target_index: usize,
+    move_index: usize,
+    reinstate_captures: bool,
+) -> Reversion {
+    let reverted = pawns[target_index].revert_from(move_index);
+    let mut records = reverted.into_iter();
+    let Some(directly_reverted) = records.next() else {
+        return Reversion::default();
+    };
+    let reverted_to = Some(pawns[target_index].position);
+    let directly_reverted_cards = directly_reverted.actual_cards.clone();
+
+    let mut swept_up_cards = Vec::new();
+    let mut candidates: Vec<(PawnId, SpaceId)> = directly_reverted.captures_caused.clone();
+    for record in records {
+        swept_up_cards.extend(record.actual_cards);
+        candidates.extend(record.captures_caused);
+    }
+
+    let reinstated_captures = if reinstate_captures {
+        candidates
+            .into_iter()
+            .filter(|&(captured_id, _)| {
+                pawns.iter().any(|pawn| {
+                    pawn.id == captured_id
+                        && topology.yard_spaces(pawn.owner).contains(&pawn.position)
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    for &(captured_id, position) in &reinstated_captures {
+        if let Some(captured) = pawns.iter_mut().find(|pawn| pawn.id == captured_id) {
+            captured.position = position;
+        }
+    }
+
+    Reversion {
+        reverted_to,
+        directly_reverted_cards,
+        swept_up_cards,
+        reinstated_captures,
     }
 }
 
@@ -303,5 +426,60 @@ pub(crate) mod tests {
         assert_eq!(pawn.revert_from(5), Vec::new());
         assert_eq!(pawn.position, SpaceId(3));
         assert_eq!(pawn.auditable_moves().count(), 1);
+    }
+
+    #[test]
+    fn is_a_lie_ignores_card_order() {
+        assert!(!record(vec![1, 2], vec![2, 1], 0, 1).is_a_lie());
+        assert!(record(vec![1, 2], vec![1, 3], 0, 1).is_a_lie());
+        assert!(record(vec![1], vec![1, 2], 0, 1).is_a_lie());
+    }
+
+    #[test]
+    fn attach_and_read_persistent_and_claimed_effects() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        pawn.attach_persistent_effect(PersistentEffectState {
+            source_card: CardKindId(9),
+            anchor: EffectAnchor::Pawn(PawnId(0)),
+            revealed: false,
+            expires: Some(ExpiryCondition::OnPawnMoved),
+        });
+        pawn.attach_claimed_effect(ClaimedEffectState {
+            source_card: CardKindId(9),
+            anchor: EffectAnchor::Pawn(PawnId(0)),
+        });
+
+        assert_eq!(pawn.persistent_effects().len(), 1);
+        assert_eq!(pawn.claimed_effects().len(), 1);
+    }
+
+    #[test]
+    fn revert_reinstates_captures_and_reports_split_cards() {
+        let captured_yard_slot = SpaceId(2);
+        let mut pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), SpaceId(7)),
+            bare_pawn(PawnId(1), PlayerColor(1), captured_yard_slot),
+        ];
+        let topology = crate::board::BoardTopology::standard_ring(2, 8, 3, 2).unwrap();
+        let mut lie = record(vec![9], vec![1], 4, 5);
+        lie.captures_caused = vec![(PawnId(1), SpaceId(5))];
+        pawns[0].push_move(lie, 5);
+        pawns[0].push_move(record(vec![2], vec![2], 5, 6), 5);
+
+        let reversion = revert(&mut pawns, &topology, 0, 0, true);
+
+        assert_eq!(reversion.reverted_to, Some(SpaceId(4)));
+        assert_eq!(reversion.directly_reverted_cards, vec![CardKindId(1)]);
+        assert_eq!(reversion.swept_up_cards, vec![CardKindId(2)]);
+        assert_eq!(reversion.reinstated_captures, vec![(PawnId(1), SpaceId(5))]);
+        assert_eq!(pawns[1].position, SpaceId(5));
+    }
+
+    #[test]
+    fn revert_out_of_range_reports_nothing() {
+        let mut pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), SpaceId(3))];
+        let topology = crate::board::BoardTopology::standard_ring(2, 8, 3, 2).unwrap();
+        let reversion = revert(&mut pawns, &topology, 0, 9, true);
+        assert_eq!(reversion, Reversion::default());
     }
 }
