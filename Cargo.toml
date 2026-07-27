@@ -5,11 +5,11 @@ edition = "2024"
 publish = false          # never intended for crates.io — internal to this project
 
 [dependencies]
+bon = "3.9.3"          # RuleConfig builder
 thiserror = "2.0.19"  # error enums (GameError, MoveError, BoardError, ...)
 # Add as each module actually needs them, via `cargo add <name>` (not hand-typed
 # versions here — let cargo resolve the current version). Anticipated so far,
 # per ARCHITECTURE.md:
-#   cargo add bon         # RuleConfig builder
 #   cargo add rand        # shuffling / random draws (Deck, SharedPile)
 #
 # Weigh anything beyond this list against ARCHITECTURE.md's "critically weigh
