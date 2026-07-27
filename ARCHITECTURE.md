@@ -802,22 +802,20 @@ pub struct MoveRecord {
 pub enum RevealScope { Hidden, Public }
 ```
 
-**Implementation status.** Only a minimal slice of this section exists so
-far (§16 steps 3–4, ahead of this module's own step 6): `PawnId`, a
-minimal `Pawn` (just `id`/`owner`/`position` — no `persistent_effects`,
-`claimed_effects`, or `history` fields yet), `EffectAnchor`,
-`PersistentEffectState`, and `ExpiryCondition`. `ClaimedEffectState`,
-`MoveRecord`, `RevealScope`, and all of `impl Pawn` below are still
-exactly as shown here — not yet built.
+**Implementation status.** Fully built (§16 step 6): `ClaimedEffectState`,
+`MoveRecord` (plus `PartialEq`/`Eq`/`Debug`, not just `Clone`, for test
+assertions), and `RevealScope` all match this section exactly. `Pawn` has
+its full field set now (`persistent_effects`, `claimed_effects`, `history`
+all present).
 
 `Pawn.owner` is `PlayerColor` here, not `PlayerId` as shown above:
 `movement::walk`'s blockade check needs to know which *board color* owns
 each pawn, and it only takes a bare `pawns: &[Pawn]` slice with no
-accompanying `Player` list to resolve `PlayerId` → color. Worth revisiting
-once `player.rs`/this module get their full build-out: `Pawn` may need to
-carry both `PlayerId` (economic ownership) and something color-resolvable,
-or `PlayerId`/`PlayerColor` may turn out to always be interchangeable by
-convention (one color per player, fixed at setup).
+accompanying `Player` list to resolve `PlayerId` → color. Revisited in
+`audit.rs` (§9), which turned out to be the first place that genuinely
+needs a `PlayerId` (for `AuditContext.auditee`): rather than change
+`Pawn` again, `audit::resolve` takes a `players: &[Player]` slice and
+looks up the target pawn's owning color there. `Pawn` itself stays as-is.
 
 `EffectAnchor` is defined here rather than in `context/play_context.rs` as
 §4 shows it — see that section's implementation-status note.
@@ -846,6 +844,29 @@ impl Pawn {
     pub fn revert_from(&mut self, index: usize) -> Vec<MoveRecord> { todo!() }
 }
 ```
+
+**Implementation status.** `impl Pawn` is fully built, with three
+signature changes from what's shown above, all to avoid a panic where the
+doc's `()` return type couldn't report one:
+- `push_move` returns `Option<MoveRecord>` (the aged-out record, if any) —
+  not `()`. Something has to route that record's `actual_cards` back to
+  the owner's reserve, and silently dropping it would leak cards out of
+  the closed economy described in §10.
+- `clear_history_on_exit` returns `Vec<CardKindId>` (every drained
+  record's `actual_cards`, flattened) — not `()`, for the same reason. It
+  shares a private `drain_history_cards` helper with
+  `collect_early_forfeiting_reinstatement`, since the two only differ in
+  *when* they're called, not in what they do.
+- `revert_from` treats `index >= history.len()` as "nothing to revert"
+  (returns an empty `Vec` instead of letting `VecDeque::split_off` panic).
+  `audit.rs` already validates the index before calling this, but `Pawn`
+  is a public type and shouldn't trust an out-of-range index from every
+  possible caller.
+
+`auditable_moves` and `capture_to` match this section exactly (`capture_to`
+also clears `claimed_effects`, which isn't shown above but follows the
+same logic as `persistent_effects` — a captured pawn's outstanding claims
+are moot once it's off the board).
 
 `RuleConfig::captured_pawns_remain_auditable` governs whether
 `auditable_moves()` results for a pawn currently sitting in the yard are
@@ -907,6 +928,44 @@ but having played `[Double, Take1]` is not a lie. The audited record's
 `reveal` is set to `Public` if it turns out `ClaimWasTrue` (it stays in
 history, now provably honest); on `LieCaught` the record and everything
 after it are simply gone from history, redistributed as described in §10.
+
+**Implementation status.** Fully implemented (§16 step 6), with three
+deviations from the above:
+
+- `AuditOutcome` is defined in `card/mod.rs`, not here — `CardBehavior`'s
+  `on_audited_as_*` hooks need it, and `audit ──> card` per §1's
+  dependency graph means `card` can't depend on `audit`. Same fix as
+  `EffectAnchor` moving to `pawn.rs`: the shared type moves to whichever
+  module is lower in the graph among the ones that need it.
+- `RevertOutcome.cards_collected` is split into `directly_audited_cards`
+  and `swept_up_cards` instead of one flattened list. A single list loses
+  exactly the distinction `RuleConfig::cascade_lie_rewards_destination`
+  needs (whether the cascade's swept-up cards follow the directly-audited
+  move to the auditor, or go to the pile instead) — with nothing marking
+  where the directly-audited move's cards end and the swept-up ones
+  begin, that rule could never be honored downstream. Which destination
+  each list actually lands in is still the caller's decision, same as
+  everything else deferred below.
+- A new `AuditError` (`UnknownPawn`, `UnknownMoveIndex`, `UnknownAuditee`)
+  lets the resolution function below report a bad `AuditRequest` as a
+  `Result` instead of panicking.
+
+The doc above doesn't show an explicit resolution function — it only
+describes the *behavior* narratively. That behavior lives in
+`audit::resolve(request: &AuditRequest, catalog: &CardCatalog, topology:
+&BoardTopology, rules: &RuleConfig, players: &[Player], pawns: &mut
+[Pawn]) -> Result<AuditResolution, AuditError>`. `players` exists solely
+to resolve the target pawn's `PlayerColor` into a `PlayerId` for
+`AuditContext.auditee` — see §8's note on `Pawn.owner`.
+
+Deliberately out of scope for `resolve`: paying `audit_attempt_cost` /
+`false_accusation_card_cost`, and routing `RevertOutcome`'s cards to
+hands/decks/the shared pile. Those touch multiple players' economies at
+once — `GameState`'s job (§16 step 8), not this function's. `resolve`
+only reports what happened to the audited pawn; a reinstated capture's
+"unless it has since moved" check (GAME_DESIGN.md) is done by checking
+whether the captured pawn's *current* position is still one of its own
+`topology.yard_spaces(...)` — if it's moved on since, it's left alone.
 
 ---
 

@@ -165,11 +165,7 @@ mod tests {
             NextSpace::Single(space) => space,
             other => panic!("expected a single yard exit edge, got {other:?}"),
         };
-        vec![Pawn {
-            id: PawnId(0),
-            owner: color,
-            position: entry,
-        }]
+        vec![crate::pawn::tests::bare_pawn(PawnId(0), color, entry)]
     }
 
     #[test]
