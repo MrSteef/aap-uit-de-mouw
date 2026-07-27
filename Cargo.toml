@@ -1,0 +1,30 @@
+[package]
+name = "aap_uit_de_mouw_core"
+version = "0.1.0"
+edition = "2024"
+publish = false          # never intended for crates.io — internal to this project
+
+[dependencies]
+# Add as each module actually needs them, via `cargo add <name>` (not hand-typed
+# versions here — let cargo resolve the current version). Anticipated so far,
+# per ARCHITECTURE.md:
+#   cargo add thiserror   # error enums (GameError, MoveError, ...)
+#   cargo add bon         # RuleConfig builder
+#   cargo add rand        # shuffling / random draws (Deck, SharedPile)
+#
+# Weigh anything beyond this list against ARCHITECTURE.md's "critically weigh
+# every dependency" note before adding it.
+
+[dev-dependencies]
+# Test-only deps go here (e.g. `cargo add --dev proptest` if property tests on
+# board.rs turn out to want it — see ARCHITECTURE.md §15). Nothing needed yet.
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+# `pedantic` is a stricter, more opinionated group on top of `all` — worth
+# turning on later once the basic shape of the codebase has settled, but
+# it's noisy to enable from day one. Uncomment when ready:
+# pedantic = "warn"

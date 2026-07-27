@@ -1,0 +1,5 @@
+# Deliberately minimal — default rustfmt output is already good, idiomatic
+# Rust formatting, and this project's coding standard prefers that over
+# custom formatting opinions. `edition` just needs to match Cargo.toml so
+# rustfmt parses edition-specific syntax correctly.
+edition = "2024"

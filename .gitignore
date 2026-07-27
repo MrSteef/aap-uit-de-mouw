@@ -1,0 +1,10 @@
+# Build artifacts
+/target
+
+# Personal, machine-specific Claude Code notes — see memory.md conventions.
+# Not created yet, but harmless to ignore up front.
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Editor cruft
+.DS_Store
