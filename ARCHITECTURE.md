@@ -1337,6 +1337,25 @@ pub fn play_one_turn(
 }
 ```
 
+**Implementation status.** All of §12 is implemented as shown (§16 step 8),
+using `.first()` instead of `.get(0)` (equivalent, just clippy's preferred
+spelling). Two bugs the fuzz test described in §15 actually caught while
+building this:
+
+- `apply`'s `PlayCard` handler was the only place that advanced
+  `current_player` — an audit-ending turn (`auditing_costs_turn`, or a
+  `StunTrapCard` forfeit) never did. Fixed in `game.rs`'s `apply_audit`:
+  it now advances the turn itself once no forfeit from that same audit is
+  still pending.
+- `legal_actions` originally offered every combinatorially-valid card
+  combo without checking whether the resulting move could actually
+  resolve — a combo landing a pawn exactly on its own home-lane fork
+  would return `MoveError::UnresolvedBranch` if submitted, since there's
+  no branch-resolution mechanism (§6). Fixed with a `combo_is_walkable`
+  check in `game.rs` that trial-runs the real `on_claimed`/
+  `resolve_movement` dispatch against a scratch clone of the pawns before
+  offering a combo as legal.
+
 ---
 
 ## 13. Orchestration — `game.rs`
@@ -1399,6 +1418,56 @@ pub enum GameEvent {
 
 pub enum PileSource { AgedOutOverflow, CapturedPawnFinished, CascadedAuditSpoils, AutomaticAuditSpoils }
 ```
+
+**Implementation status.** `GameState`/`GameEngine`/`GameError` are implemented
+(§16 step 8), with several deviations:
+
+- `TurnAction::PlayCard` wraps `PlayedCard`, not a bare `Declaration`. A
+  bare `Declaration` only carries the claim — with no way to say what was
+  truly played, bluffing (the entire point of this game) could never
+  reach the engine at all. `play::PlayedCard` exists specifically to pair
+  a claim with the truth, so `PlayCard` wraps that instead.
+- `pending_forfeit` is `Option<PendingForfeit>` (a private struct: `owed_by:
+  PlayerId, target: PaymentTarget, remaining: u8`), not `Option<(PlayerId,
+  u8)>`. The tuple has no way to say *who receives* the forfeited cards —
+  `false_accusation_destination` can be `SharedPile` or `Auditee`, and
+  once a `PayerChooses` forfeit is set up, that destination has to survive
+  across however many separate `ForfeitCard` submissions it takes to
+  clear. `PaymentTarget` (`SharedPile` or `Player(PlayerId)`) resolves the
+  destination once, up front.
+- `GameEvent::AuditResolved` carries `auditor: PlayerId, target_pawn:
+  PawnId, target_move_index: usize, outcome: AuditOutcome` instead of a
+  full `AuditRequest` — referencing `audit::AuditRequest` from `event.rs`
+  would create a cycle (`event ──> audit ──> card ──> context ──> event`,
+  since `context` already depends on `event`), so the fields actually
+  needed are inlined instead (see `event.rs`'s own doc comment on the
+  variant). `PileSource` gained three variants
+  (`AuditAttemptCostOverflow`, `FalseAccusationOverflow`,
+  `GrantBounceback`) not shown above, for overflow points this section's
+  card-payment logic actually has that the original four don't cover —
+  see `event.rs`'s own doc comments on each.
+- `legal_actions`'s `PlayCard` enumeration only offers *honest* plays
+  (claimed == actual) — enumerating every possible *lie* isn't bounded
+  (a claim can name any card in the catalog, not just what's in hand), so
+  there's no sensible "legal claims" menu to build. An agent that wants to
+  bluff takes one of these honest baselines and swaps its
+  `declaration.claimed_cards` before submitting — `apply` only validates
+  that `actual_cards` are genuinely in hand and that counts/categories are
+  within `RuleConfig`'s limits; it never checks the claim against hand
+  contents, since a claim isn't supposed to be checkable that way.
+- Not implemented at all: `RuleConfig::cards_exhausted_behavior` /
+  `no_available_action_behavior` (§3, §10) — the elimination/lifeline
+  gates for a player running out of cards. This is a real, acknowledged
+  gap, not an oversight rediscovered later: the rest of the turn loop
+  (`apply`, `legal_actions`, card payments/overflow, capture rewards, turn
+  advancement including `StunTrapCard`'s skip) is implemented and tested,
+  but running-out handling is deferred as its own self-contained follow-up
+  given this step's already-large scope.
+- A reinstated capture's position change (from `audit::resolve`'s
+  `RevertOutcome`) is applied but not separately logged — `GameEvent` has
+  no variant describing "a pawn was reinstated," and adding one felt like
+  scope creep against the size this step already reached. The state
+  change itself is correct; only the event log doesn't narrate it.
 
 ---
 
