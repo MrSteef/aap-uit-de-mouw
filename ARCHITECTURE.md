@@ -1537,14 +1537,6 @@ pub enum PileSource { AgedOutOverflow, CapturedPawnFinished, CascadedAuditSpoils
   that `actual_cards` are genuinely in hand and that counts/categories are
   within `RuleConfig`'s limits; it never checks the claim against hand
   contents, since a claim isn't supposed to be checkable that way.
-- Not implemented at all: `RuleConfig::cards_exhausted_behavior` /
-  `no_available_action_behavior` (§3, §10) — the elimination/lifeline
-  gates for a player running out of cards. This is a real, acknowledged
-  gap, not an oversight rediscovered later: the rest of the turn loop
-  (`apply`, `legal_actions`, card payments/overflow, capture rewards, turn
-  advancement including `StunTrapCard`'s skip) is implemented and tested,
-  but running-out handling is deferred as its own self-contained follow-up
-  given this step's already-large scope.
 - A reinstated capture's position change (from `audit::resolve`'s
   `RevertOutcome`) is applied but not separately logged — `GameEvent` has
   no variant describing "a pawn was reinstated," and adding one felt like
@@ -1563,6 +1555,64 @@ with a `CardsTransferred` event. The private `resolve_auditee` helper is
 renamed `resolve_pawn_owner` — it now resolves an automatic audit's
 attacker and defender too, not just a deliberate audit's auditee, so the
 old name undersold what it does.
+
+**Also fixed since:** `RuleConfig::cards_exhausted_behavior` /
+`no_available_action_behavior`, previously flagged above as a real,
+acknowledged gap, are now implemented.
+
+- `GameState` gains `eliminated_players: HashMap<PlayerId,
+  EliminatedPawnHandling>`. `advance_turn` (the old free function) splits
+  into `advance_to_next_player` (unchanged turn-order logic, now also
+  permanently skipping anyone in `eliminated_players`, not just
+  `forfeited_next_turn`'s one-turn skip) and `advance_turn` itself, which
+  calls that and then `resolve_turn_start_gates` — the actual two-gate
+  loop, run every time a turn ends (both call sites now thread `&mut
+  events` through) rather than exposed as a new public `GameEngine`
+  method. Bounded to `players.len() + 1` iterations rather than looping
+  unconditionally, so a pathological all-players-eliminated case can't
+  hang instead of just leaving the game in a degenerate (but terminating)
+  state — determining an actual game-over condition from that state is
+  out of scope here.
+- Gate 1's condition (`hand_and_deck_are_empty`) and gate 2's
+  (`has_no_legal_action`) are both narrower than "`legal_actions` is
+  empty" — deliberately so for gate 2, matching `GAME_DESIGN.md`'s literal
+  wording: a free audit (`audit_attempt_cost == 0`) can still be legal
+  with an empty hand without that counting as "having an option." Gate 2
+  is only reached if gate 1 didn't already eliminate the player.
+- `AutoSkip` needs no dedicated state at all: `TurnAction::Pass` is new,
+  and `legal_actions` appends it whenever it would otherwise return
+  empty — which covers `AutoSkip` directly, and `DrawCard(n)` falling
+  back to it too if the pile was too short to actually produce an option
+  (`grant_cards_from_pile`, already built for the capture reward, turned
+  out to be exactly the right helper for this lifeline as well — see its
+  own doc comment). `apply(Pass)` is a new `apply_pass`, emitting a new
+  `GameEvent::TurnPassed` (distinct from `TurnForfeited`, which is a
+  penalty from a card like `StunTrapCard`, not simply having nothing to
+  do) and ending the turn like anything else does.
+- `Eliminated(Frozen | Removed)` for either gate goes through one
+  `eliminate_player`, idempotent against being called twice. `Removed`
+  additionally sends every one of the player's pawns to the yard and
+  force-drains each one's dormant history to the pile immediately (via
+  the existing `collect_early_forfeiting_reinstatement`) — normal
+  resolution assumes a future turn that will never come. `Frozen` does
+  nothing eagerly; its pawns stay exactly as interactable as before, and
+  the redirect for *their* card flows happens lazily, at the point each
+  one would occur:
+  - `route_payment` redirects a false-accusation payment to the pile
+    instead of a frozen auditee.
+  - `apply_play_card`'s capture-processing loop force-drains a captured
+    pawn's history to the pile if its owner is frozen, the same reasoning
+    as `Removed` above, just triggered by capture instead of elimination.
+  
+  Both reuse one new `PileSource::EliminatedPlayerRedirect` — a single
+  variant covering the payment-redirect and history-drain cases, since
+  they're the same underlying idea (a card that would've reached an
+  eliminated player, redirected because they no longer can act on it).
+- Not handled: a fresh game's very first turn. Gate resolution runs after
+  every turn *ends*, not at construction — a `RuleConfig` set up such that
+  the initial `current_player` already can't act on turn one isn't
+  special-cased. In practice this only matters for a deliberately
+  degenerate starting configuration.
 
 ---
 

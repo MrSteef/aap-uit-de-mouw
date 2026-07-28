@@ -20,8 +20,9 @@ use crate::pawn::{
 use crate::play::{Declaration, PlayedCard};
 use crate::player::{Player, PlayerId};
 use crate::rules::{
-    AutomaticAuditCardDestination, CardDestination, CascadeSweepDestination, ExitRule,
-    FinishedPawnHistoryDestination, PaymentSelectionMode, RuleConfig,
+    AutomaticAuditCardDestination, CardDestination, CardsExhaustedBehavior,
+    CascadeSweepDestination, EliminatedPawnHandling, ExitRule, FinishedPawnHistoryDestination,
+    NoAvailableActionBehavior, PaymentSelectionMode, RuleConfig,
 };
 use crate::view::{self, GameView};
 
@@ -39,6 +40,10 @@ pub enum TurnAction {
     /// Only ever legal when a forfeit is pending for you.
     ForfeitCard(CardKindId),
     PlayCard(PlayedCard),
+    /// Only ever legal when no other action is possible at all — see
+    /// `RuleConfig::no_available_action_behavior`. Ends the turn without
+    /// doing anything else.
+    Pass,
 }
 
 /// Where a pending forfeit's cards are ultimately headed — resolved once,
@@ -71,6 +76,12 @@ pub struct GameState {
     forfeited_next_turn: HashSet<PlayerId>,
     pending_forfeit: Option<PendingForfeit>,
     space_effects: HashMap<SpaceId, Vec<PersistentEffectState>>,
+    /// Who's out, and how their pawns behave for the rest of the game —
+    /// see `RuleConfig::cards_exhausted_behavior`/
+    /// `no_available_action_behavior`. An eliminated player is skipped
+    /// permanently by `advance_turn`, unlike `forfeited_next_turn`'s
+    /// one-turn skip.
+    eliminated_players: HashMap<PlayerId, EliminatedPawnHandling>,
 }
 
 /// Ways an action can fail to apply.
@@ -149,6 +160,7 @@ impl GameState {
             forfeited_next_turn: HashSet::new(),
             pending_forfeit: None,
             space_effects: HashMap::new(),
+            eliminated_players: HashMap::new(),
         }
     }
 
@@ -173,6 +185,103 @@ impl GameState {
             .find(|player| player.color == pawn.owner)
             .map(|player| player.id)
             .ok_or(GameError::Audit(AuditError::UnknownAuditee(target_pawn)))
+    }
+
+    /// Whether `player` is eliminated under `EliminatedPawnHandling::Frozen`
+    /// specifically — the case where card flows that would otherwise land
+    /// with them get redirected to the shared pile instead, since they can
+    /// no longer act to claim or use anything (see `route_payment` and the
+    /// capture-processing loop in `apply_play_card`).
+    fn is_frozen(&self, player: PlayerId) -> bool {
+        self.eliminated_players.get(&player) == Some(&EliminatedPawnHandling::Frozen)
+    }
+
+    /// Gate 1's trigger condition: `player`'s own hand and reserve are both
+    /// completely empty, independent of whether they could otherwise still
+    /// act (e.g. via a dormant collectible pawn in their yard — that's
+    /// gate 2's concern, not this one).
+    fn hand_and_deck_are_empty(&self, player: PlayerId) -> bool {
+        let Ok(idx) = self.player_index(player) else {
+            return false;
+        };
+        self.players[idx].hand.is_empty() && self.players[idx].deck.is_empty()
+    }
+
+    /// Gate 2's trigger condition: `player` has an empty hand *and* no
+    /// dormant cards collectible from any of their own pawns sitting in
+    /// the yard — i.e. genuinely no legal action available. Deliberately
+    /// narrower than "`legal_actions` is empty": a free audit (when
+    /// `audit_attempt_cost` is 0) can still be legal here without this
+    /// being considered "having an option," per `GAME_DESIGN.md`'s
+    /// wording — this gate is about movement/card-play options, not
+    /// auditing specifically.
+    fn has_no_legal_action(&self, player: PlayerId) -> bool {
+        let Ok(idx) = self.player_index(player) else {
+            return true;
+        };
+        if !self.players[idx].hand.is_empty() {
+            return false;
+        }
+        let color = self.players[idx].color;
+        !self.pawns.iter().any(|pawn| {
+            pawn.owner == color
+                && self
+                    .topology
+                    .node(pawn.position)
+                    .is_ok_and(|node| node.kind == SpaceKind::Yard)
+                && pawn.auditable_moves().count() > 0
+        })
+    }
+
+    /// Marks `player` eliminated under `handling`, emitting
+    /// `GameEvent::PlayerEliminated`. Under `Removed`, every one of their
+    /// pawns is sent to the yard (if not there already) and has its
+    /// dormant history force-drained to the shared pile immediately —
+    /// normal resolution (waiting for a yard-exit, or the owner cashing in
+    /// early) will never happen for a player who no longer gets turns.
+    /// `Frozen` doesn't need any of that here: a frozen pawn stays exactly
+    /// as interactable as before, and the redirect for *its* card flows
+    /// happens at the point each one would occur (`route_payment`,
+    /// `apply_play_card`'s capture handling), not eagerly here.
+    fn eliminate_player(
+        &mut self,
+        player: PlayerId,
+        handling: EliminatedPawnHandling,
+        events: &mut Vec<GameEvent>,
+    ) {
+        if self.eliminated_players.contains_key(&player) {
+            return;
+        }
+        self.eliminated_players.insert(player, handling);
+        events.push(GameEvent::PlayerEliminated { player });
+
+        if handling != EliminatedPawnHandling::Removed {
+            return;
+        }
+        let Ok(idx) = self.player_index(player) else {
+            return;
+        };
+        let color = self.players[idx].color;
+        let yard_slot = self.topology.yard_spaces(color).first().copied();
+        for pawn_idx in 0..self.pawns.len() {
+            if self.pawns[pawn_idx].owner != color {
+                continue;
+            }
+            if let Some(yard_slot) = yard_slot {
+                self.pawns[pawn_idx].capture_to(yard_slot);
+            }
+            let dumped = self.pawns[pawn_idx].collect_early_forfeiting_reinstatement();
+            if dumped.is_empty() {
+                continue;
+            }
+            for &card in &dumped {
+                self.shared_pile.add(card);
+            }
+            events.push(GameEvent::CardsEnteredPile {
+                cards: dumped,
+                source: PileSource::EliminatedPlayerRedirect,
+            });
+        }
     }
 
     /// Whether claiming `combo` for `pawn_id` would actually resolve —
@@ -368,6 +477,19 @@ impl GameState {
         if cards.is_empty() {
             return;
         }
+        // A frozen auditee can no longer act to claim or use anything —
+        // redirect what would otherwise land with them to the pile
+        // instead, same as the SharedPile case.
+        if destination == CardDestination::Auditee && self.is_frozen(auditee) {
+            for &card in &cards {
+                self.shared_pile.add(card);
+            }
+            events.push(GameEvent::CardsEnteredPile {
+                cards,
+                source: PileSource::EliminatedPlayerRedirect,
+            });
+            return;
+        }
         match destination {
             CardDestination::SharedPile => {
                 for &card in &cards {
@@ -432,7 +554,10 @@ impl GameState {
 
     /// Advances `current_player` to the next player in turn order, skipping
     /// anyone who currently owes a forfeited turn (`StunTrapCard`).
-    fn advance_turn(&mut self) {
+    /// Picks the next player in turn order, skipping anyone who currently
+    /// owes a forfeited turn (`StunTrapCard`, one turn only) or has been
+    /// eliminated (permanent, unlike a forfeit).
+    fn advance_to_next_player(&mut self) {
         let player_count = self.players.len();
         if player_count == 0 {
             return;
@@ -449,9 +574,58 @@ impl GameState {
                 next_idx = (next_idx + 1) % player_count;
                 continue;
             }
+            if self.eliminated_players.contains_key(&candidate) {
+                next_idx = (next_idx + 1) % player_count;
+                continue;
+            }
             break;
         }
         self.current_player = self.players[next_idx].id;
+    }
+
+    /// Advances to the next player, then resolves whatever's true for them
+    /// at the start of their turn — `RuleConfig::cards_exhausted_behavior`
+    /// (gate 1) and `no_available_action_behavior` (gate 2), looping past
+    /// any further eliminations those gates themselves cause. Called after
+    /// every turn-ending action; not called for the very first turn of a
+    /// fresh game, so a ruleset configured such that the initial player
+    /// already can't act isn't handled specially.
+    fn advance_turn(&mut self, events: &mut Vec<GameEvent>) {
+        self.advance_to_next_player();
+        self.resolve_turn_start_gates(events);
+    }
+
+    fn resolve_turn_start_gates(&mut self, events: &mut Vec<GameEvent>) {
+        // Bounded rather than an unconditional loop: if every player were
+        // somehow eliminated, gate 1/2 re-triggering for whoever's left
+        // "current" would otherwise spin forever. Determining an actual
+        // game-over condition is out of scope here; this just guarantees
+        // termination in that degenerate case.
+        for _ in 0..=self.players.len() {
+            let player = self.current_player;
+            if self.hand_and_deck_are_empty(player)
+                && let CardsExhaustedBehavior::Eliminated(handling) =
+                    self.rules.cards_exhausted_behavior
+            {
+                self.eliminate_player(player, handling, events);
+                self.advance_to_next_player();
+                continue;
+            }
+            if self.has_no_legal_action(player) {
+                match self.rules.no_available_action_behavior {
+                    NoAvailableActionBehavior::AutoSkip => {}
+                    NoAvailableActionBehavior::DrawCard(n) => {
+                        self.grant_cards_from_pile(player, n, events);
+                    }
+                    NoAvailableActionBehavior::Eliminated(handling) => {
+                        self.eliminate_player(player, handling, events);
+                        self.advance_to_next_player();
+                        continue;
+                    }
+                }
+            }
+            break;
+        }
     }
 
     fn apply_play_card(&mut self, played: PlayedCard) -> Result<Vec<GameEvent>, GameError> {
@@ -645,10 +819,31 @@ impl GameState {
                 self.rules.capture_reward_from_pile,
                 &mut events,
             );
+            // A frozen owner never gets another turn, so the normal "wait
+            // for a yard-exit, or cash in early" resolution for a captured
+            // pawn's dormant history would otherwise leave it stuck
+            // forever — drain it to the pile immediately instead, same
+            // reasoning as the finished-pawn dump above.
+            if let Ok(owner) = self.resolve_pawn_owner(captured_pawn)
+                && self.is_frozen(owner)
+                && let Some(captured_idx) =
+                    self.pawns.iter().position(|pawn| pawn.id == captured_pawn)
+            {
+                let dumped = self.pawns[captured_idx].collect_early_forfeiting_reinstatement();
+                if !dumped.is_empty() {
+                    for &card in &dumped {
+                        self.shared_pile.add(card);
+                    }
+                    events.push(GameEvent::CardsEnteredPile {
+                        cards: dumped,
+                        source: PileSource::EliminatedPlayerRedirect,
+                    });
+                }
+            }
         }
 
         self.end_of_turn_draw(acting_player);
-        self.advance_turn();
+        self.advance_turn(&mut events);
 
         Ok(events)
     }
@@ -804,7 +999,7 @@ impl GameState {
             && self.pending_forfeit.is_none()
         {
             self.end_of_turn_draw(request.auditor);
-            self.advance_turn();
+            self.advance_turn(&mut events);
         }
 
         Ok(events)
@@ -859,6 +1054,20 @@ impl GameState {
             })
         };
 
+        Ok(events)
+    }
+
+    /// The only legal action when nothing else is (see the `Pass` variant
+    /// doc comment and `legal_actions`'s fallback) — ends the turn without
+    /// doing anything else, still subject to the normal end-of-turn draw.
+    fn apply_pass(&mut self) -> Result<Vec<GameEvent>, GameError> {
+        if self.pending_forfeit.is_some() {
+            return Err(GameError::PendingForfeitOwed);
+        }
+        let player = self.current_player;
+        let mut events = vec![GameEvent::TurnPassed { player }];
+        self.end_of_turn_draw(player);
+        self.advance_turn(&mut events);
         Ok(events)
     }
 }
@@ -953,6 +1162,15 @@ impl GameEngine for GameState {
             }
         }
 
+        // Never leave an agent with nothing to choose from — whether
+        // that's because `no_available_action_behavior` is `AutoSkip`,
+        // or because `DrawCard`'s lifeline still wasn't enough (the pile
+        // was short), the result looks the same here: no other action
+        // exists, so passing is the only legal one.
+        if actions.is_empty() {
+            actions.push(TurnAction::Pass);
+        }
+
         actions
     }
 
@@ -961,6 +1179,7 @@ impl GameEngine for GameState {
             TurnAction::Audit(request) => self.apply_audit(request),
             TurnAction::ForfeitCard(card) => self.apply_forfeit_card(card),
             TurnAction::PlayCard(played) => self.apply_play_card(played),
+            TurnAction::Pass => self.apply_pass(),
         }
     }
 
@@ -1591,6 +1810,405 @@ mod tests {
         // (still within the same turn) drew back up to hand_soft_cap from
         // their own empty deck — so the routed card is what remains.
         assert_eq!(state.players[1].hand, vec![CardKindId(0)]);
+    }
+
+    #[test]
+    fn cards_exhausted_ignored_falls_through_to_gate_two() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, vec![CardKindId(0)])];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(), // cards_exhausted_behavior: Ignored, no_available_action_behavior: AutoSkip
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        state.resolve_turn_start_gates(&mut events);
+
+        assert!(events.is_empty());
+        assert!(state.eliminated_players.is_empty());
+        assert_eq!(state.legal_actions(PlayerId(0)), vec![TurnAction::Pass]);
+    }
+
+    #[test]
+    fn cards_exhausted_eliminates_even_with_a_yard_collectible_pawn() {
+        let topology = board();
+        let yard0 = topology.yard_spaces(PlayerColor(0))[0];
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, vec![CardKindId(0)])];
+        let mut dormant_pawn = bare_pawn(PawnId(0), PlayerColor(0), yard0);
+        dormant_pawn.push_move(
+            MoveRecord {
+                sequence: 0,
+                claimed_cards: vec![CardKindId(1)],
+                actual_cards: vec![CardKindId(1)],
+                position_before: yard0,
+                position_after: yard0,
+                captures_caused: Vec::new(),
+                reveal: RevealScope::Hidden,
+            },
+            3,
+        );
+        let rules = RuleConfig {
+            cards_exhausted_behavior: CardsExhaustedBehavior::Eliminated(
+                EliminatedPawnHandling::Frozen,
+            ),
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            vec![dormant_pawn],
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        // Gate 2 alone would NOT trigger here — there IS a yard-collectible
+        // pawn — but gate 1 (empty hand + deck) takes priority regardless.
+        assert!(!state.has_no_legal_action(PlayerId(0)));
+
+        let mut events = Vec::new();
+        state.resolve_turn_start_gates(&mut events);
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::PlayerEliminated {
+                player: PlayerId(0)
+            }
+        )));
+        assert!(state.is_frozen(PlayerId(0)));
+        assert_eq!(state.current_player, PlayerId(1));
+    }
+
+    #[test]
+    fn eliminated_players_are_skipped_permanently_by_advance_to_next_player() {
+        let topology = board();
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(0)]),
+            player(2, 0, vec![CardKindId(0)]),
+        ];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            Vec::new(),
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+        state
+            .eliminated_players
+            .insert(PlayerId(1), EliminatedPawnHandling::Frozen);
+
+        state.advance_to_next_player();
+
+        assert_eq!(state.current_player, PlayerId(2));
+    }
+
+    #[test]
+    fn eliminating_with_removed_moves_pawns_to_yard_and_drains_history() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let yard0 = topology.yard_spaces(PlayerColor(0))[0];
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, vec![CardKindId(0)])];
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), entry0); // not already in yard
+        pawn.push_move(
+            MoveRecord {
+                sequence: 0,
+                claimed_cards: vec![CardKindId(1)],
+                actual_cards: vec![CardKindId(1)],
+                position_before: entry0,
+                position_after: entry0,
+                captures_caused: Vec::new(),
+                reveal: RevealScope::Hidden,
+            },
+            3,
+        );
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            vec![pawn],
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        state.eliminate_player(PlayerId(0), EliminatedPawnHandling::Removed, &mut events);
+
+        assert_eq!(state.pawns[0].position, yard0);
+        assert_eq!(state.pawns[0].auditable_moves().count(), 0);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::CardsEnteredPile { cards, source: PileSource::EliminatedPlayerRedirect }
+                if cards == &vec![CardKindId(1)]
+        )));
+        assert_eq!(
+            state.shared_pile.take(10, &mut rand::rng()),
+            vec![CardKindId(1)]
+        );
+    }
+
+    #[test]
+    fn no_available_action_auto_skip_offers_only_pass_and_advances_the_turn() {
+        let topology = board();
+        let yard0 = topology.yard_spaces(PlayerColor(0))[0];
+        let entry1 = entry_of(&topology, PlayerColor(1));
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, vec![CardKindId(0)])];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), yard0),
+            bare_pawn(PawnId(1), PlayerColor(1), entry1),
+        ];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        assert_eq!(state.legal_actions(PlayerId(0)), vec![TurnAction::Pass]);
+
+        let events = state.apply(TurnAction::Pass).unwrap();
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::TurnPassed {
+                player: PlayerId(0)
+            }
+        )));
+        assert_eq!(state.current_player, PlayerId(1));
+    }
+
+    #[test]
+    fn no_available_action_draw_card_grants_a_lifeline_from_the_pile() {
+        let topology = board();
+        let yard0 = topology.yard_spaces(PlayerColor(0))[0];
+        let entry1 = entry_of(&topology, PlayerColor(1));
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, vec![CardKindId(0)])];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), yard0),
+            bare_pawn(PawnId(1), PlayerColor(1), entry1),
+        ];
+        let rules = RuleConfig {
+            no_available_action_behavior: NoAvailableActionBehavior::DrawCard(2),
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(vec![CardKindId(0), CardKindId(0)]),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        state.resolve_turn_start_gates(&mut events);
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::CardsGrantedFromPile {
+                player: PlayerId(0),
+                count: 2
+            }
+        )));
+        assert_eq!(state.players[0].hand, vec![CardKindId(0), CardKindId(0)]);
+        // With cards in hand now, a real action is available, not just Pass.
+        assert!(
+            state
+                .legal_actions(PlayerId(0))
+                .iter()
+                .any(|a| matches!(a, TurnAction::PlayCard(_)))
+        );
+    }
+
+    #[test]
+    fn no_available_action_draw_card_falls_back_to_pass_when_pile_is_short() {
+        let topology = board();
+        let yard0 = topology.yard_spaces(PlayerColor(0))[0];
+        let entry1 = entry_of(&topology, PlayerColor(1));
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, vec![CardKindId(0)])];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), yard0),
+            bare_pawn(PawnId(1), PlayerColor(1), entry1),
+        ];
+        let rules = RuleConfig {
+            no_available_action_behavior: NoAvailableActionBehavior::DrawCard(2),
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()), // empty pile — the lifeline can't help
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        state.resolve_turn_start_gates(&mut events);
+
+        assert!(state.players[0].hand.is_empty());
+        assert_eq!(state.legal_actions(PlayerId(0)), vec![TurnAction::Pass]);
+    }
+
+    #[test]
+    fn false_accusation_against_a_frozen_pawn_redirects_payment_to_the_pile() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let entry1 = entry_of(&topology, PlayerColor(1));
+        let players = vec![
+            player(0, 0, Vec::new()),
+            player(1, 1, vec![CardKindId(0)]), // the auditor's stake, if wrong
+        ];
+        let mut pawn0 = bare_pawn(PawnId(0), PlayerColor(0), entry0);
+        pawn0.push_move(
+            MoveRecord {
+                sequence: 0,
+                claimed_cards: vec![CardKindId(1)],
+                actual_cards: vec![CardKindId(1)], // truthful — the accusation will be wrong
+                position_before: entry0,
+                position_after: entry0,
+                captures_caused: Vec::new(),
+                reveal: RevealScope::Hidden,
+            },
+            3,
+        );
+        let pawns = vec![pawn0, bare_pawn(PawnId(1), PlayerColor(1), entry1)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(), // false_accusation_destination: Auditee, cost: 1
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(1),
+        );
+        state
+            .eliminated_players
+            .insert(PlayerId(0), EliminatedPawnHandling::Frozen);
+
+        let events = state
+            .apply(TurnAction::Audit(AuditRequest {
+                auditor: PlayerId(1),
+                target_pawn: PawnId(0),
+                target_move_index: 0,
+                attempt_cost_cards: Vec::new(),
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::CardsEnteredPile { cards, source: PileSource::EliminatedPlayerRedirect }
+                if cards == &vec![CardKindId(0)]
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GameEvent::CardsTransferred { .. })),
+            "a frozen auditee never actually receives the payment"
+        );
+    }
+
+    #[test]
+    fn capturing_a_frozen_players_pawn_drains_its_history_to_the_pile() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let defender_at = steps_from(&topology, PlayerColor(0), entry0, 2);
+        let attacker_at = steps_from(&topology, PlayerColor(0), entry0, 1);
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, vec![CardKindId(0)])];
+        let mut defender = bare_pawn(PawnId(0), PlayerColor(0), defender_at);
+        defender.push_move(
+            MoveRecord {
+                sequence: 0,
+                claimed_cards: vec![CardKindId(1)],
+                actual_cards: vec![CardKindId(1)],
+                position_before: defender_at,
+                position_after: defender_at,
+                captures_caused: Vec::new(),
+                reveal: RevealScope::Hidden,
+            },
+            3,
+        );
+        let pawns = vec![defender, bare_pawn(PawnId(1), PlayerColor(1), attacker_at)];
+        let rules = RuleConfig {
+            // Isolate from the unrelated capture-reward pile draw, so the
+            // only pile activity asserted on below is this fix's.
+            capture_reward_from_pile: 0,
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(1),
+        );
+        state
+            .eliminated_players
+            .insert(PlayerId(0), EliminatedPawnHandling::Frozen);
+
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(1),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|e| matches!(
+            e,
+            GameEvent::CardsEnteredPile { cards, source: PileSource::EliminatedPlayerRedirect }
+                if cards == &vec![CardKindId(1)]
+        )));
+        assert_eq!(state.pawns[0].auditable_moves().count(), 0);
+    }
+
+    #[test]
+    fn resolve_turn_start_gates_terminates_even_if_every_player_is_eliminated() {
+        let topology = board();
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, Vec::new())];
+        let rules = RuleConfig {
+            cards_exhausted_behavior: CardsExhaustedBehavior::Eliminated(
+                EliminatedPawnHandling::Frozen,
+            ),
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            Vec::new(),
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        // The point of this test is that it returns at all: with every
+        // player perpetually re-triggering gate 1, an unbounded loop would
+        // hang here instead.
+        let mut events = Vec::new();
+        state.resolve_turn_start_gates(&mut events);
+
+        assert_eq!(state.eliminated_players.len(), 2);
     }
 
     #[test]

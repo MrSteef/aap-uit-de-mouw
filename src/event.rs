@@ -55,6 +55,12 @@ pub enum GameEvent {
     TurnForfeited {
         player: PlayerId,
     },
+    /// A player had no legal action at all (`NoAvailableActionBehavior`)
+    /// and passed — distinct from `TurnForfeited`, which is a penalty from
+    /// a card like `StunTrapCard`, not simply having nothing to do.
+    TurnPassed {
+        player: PlayerId,
+    },
     PlayerEliminated {
         player: PlayerId,
     },
@@ -83,4 +89,10 @@ pub enum PileSource {
     /// bounced back because the recipient's hand and reserve were both
     /// already full. Rare in practice.
     GrantBounceback,
+    /// A card that would otherwise have gone to an eliminated `Frozen`
+    /// player redirected to the pile instead, since they can no longer
+    /// act to claim or use it: a false-accusation payment that would have
+    /// gone to them, or a captured/removed pawn's dormant history that
+    /// would otherwise wait on a yard-exit that will never happen.
+    EliminatedPlayerRedirect,
 }

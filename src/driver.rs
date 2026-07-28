@@ -26,6 +26,7 @@ pub fn play_one_turn(
             TurnAction::PlayCard(_) => true,
             TurnAction::Audit(_) => view.rules.auditing_costs_turn,
             TurnAction::ForfeitCard(_) => false,
+            TurnAction::Pass => true,
         };
         all_events.extend(engine.apply(action)?);
         // A pending forfeit always takes priority over ending the turn,
