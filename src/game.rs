@@ -1,0 +1,1457 @@
+//! Orchestration: the actions a player may submit, the full game state,
+//! and the engine that validates and applies them.
+
+use std::collections::{HashMap, HashSet};
+
+use rand::RngExt;
+use thiserror::Error;
+
+use crate::audit::{self, AuditConsequence, AuditError, AuditRequest};
+use crate::board::{BoardError, SpaceKind};
+use crate::board::{BoardTopology, SpaceId};
+use crate::card::{CardCatalog, CardCategory, CardKindId};
+use crate::context::{MovementProposal, PlayContext};
+use crate::deck::SharedPile;
+use crate::event::{GameEvent, PileSource};
+use crate::movement::MoveError;
+use crate::pawn::{MoveRecord, Pawn, PawnId, PersistentEffectState, RevealScope};
+use crate::play::{Declaration, PlayedCard};
+use crate::player::{Player, PlayerId};
+use crate::rules::{CardDestination, ExitRule, PaymentSelectionMode, RuleConfig};
+use crate::view::{self, GameView};
+
+/// One action a player may submit on their turn.
+///
+/// ARCHITECTURE.md §13 shows `PlayCard(Declaration)` — carrying only the
+/// claim, with no way to say what was truly played. That can't be right:
+/// without the real cards reaching the engine somehow, bluffing (the
+/// entire point of this game) could never work. `play::PlayedCard` exists
+/// specifically to pair a claim with what was truly played, so `PlayCard`
+/// wraps that instead.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum TurnAction {
+    Audit(AuditRequest),
+    /// Only ever legal when a forfeit is pending for you.
+    ForfeitCard(CardKindId),
+    PlayCard(PlayedCard),
+}
+
+/// Where a pending forfeit's cards are ultimately headed — resolved once,
+/// when the forfeit is first set up, from whichever `CardDestination` the
+/// rules specify (`Auditee` needs a concrete player id to mean anything).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PaymentTarget {
+    SharedPile,
+    Player(PlayerId),
+}
+
+/// Who still owes a forfeit, where it's headed, and how many cards remain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PendingForfeit {
+    owed_by: PlayerId,
+    target: PaymentTarget,
+    remaining: u8,
+}
+
+/// The full state of one game in progress.
+pub struct GameState {
+    pub topology: BoardTopology,
+    pub rules: RuleConfig,
+    pub catalog: CardCatalog,
+    pub players: Vec<Player>,
+    pub pawns: Vec<Pawn>,
+    pub shared_pile: SharedPile,
+    pub current_player: PlayerId,
+    audits_this_turn: u8,
+    forfeited_next_turn: HashSet<PlayerId>,
+    pending_forfeit: Option<PendingForfeit>,
+    space_effects: HashMap<SpaceId, Vec<PersistentEffectState>>,
+}
+
+/// Ways an action can fail to apply.
+#[derive(Error, Debug)]
+pub enum GameError {
+    #[error("no player exists with id {0:?}")]
+    UnknownPlayer(PlayerId),
+    #[error("no pawn exists with id {0:?}")]
+    UnknownPawn(PawnId),
+    #[error("pawn {pawn:?} doesn't belong to player {player:?}")]
+    NotYourPawn { pawn: PawnId, player: PlayerId },
+    #[error("it isn't {0:?}'s turn")]
+    NotYourTurn(PlayerId),
+    #[error("card {0:?} isn't in that player's hand")]
+    CardNotInHand(CardKindId),
+    #[error(
+        "claimed {claimed} cards but actually played {actual}, and allow_card_count_mismatch is false"
+    )]
+    CardCountMismatch { claimed: usize, actual: usize },
+    #[error("a play may include at most {max} cards, but {actual} were claimed")]
+    TooManyCards { max: u8, actual: usize },
+    #[error("category {category:?} allows at most {max} cards per play, but {actual} were claimed")]
+    TooManyOfCategory {
+        category: CardCategory,
+        max: u8,
+        actual: usize,
+    },
+    #[error("a forfeit is owed before any other action can be taken")]
+    PendingForfeitOwed,
+    #[error("no forfeit is currently owed")]
+    NoPendingForfeit,
+    #[error("at most {max} audits are allowed per turn")]
+    TooManyAudits { max: u8 },
+    #[error("payer must choose exactly {expected} cards, not {actual}")]
+    InvalidPaymentSelection { expected: u8, actual: usize },
+    #[error(transparent)]
+    Audit(#[from] AuditError),
+    #[error(transparent)]
+    Move(#[from] MoveError),
+    #[error(transparent)]
+    Board(#[from] BoardError),
+}
+
+/// What a `GameState` (or any other engine implementation) exposes to
+/// drive a game forward.
+pub trait GameEngine {
+    fn legal_actions(&self, player: PlayerId) -> Vec<TurnAction>;
+    fn apply(&mut self, action: TurnAction) -> Result<Vec<GameEvent>, GameError>;
+    fn view_for(&self, player: PlayerId) -> GameView;
+    fn current_player(&self) -> PlayerId;
+}
+
+impl GameState {
+    /// Assembles a game from already-prepared pieces — building a fresh
+    /// `Deck`/hand per player, seeding the pile, and placing pawns are the
+    /// caller's job (see ARCHITECTURE.md §10's "game start" lifecycle
+    /// step); this just wires them together.
+    pub fn new(
+        topology: BoardTopology,
+        rules: RuleConfig,
+        catalog: CardCatalog,
+        players: Vec<Player>,
+        pawns: Vec<Pawn>,
+        shared_pile: SharedPile,
+        current_player: PlayerId,
+    ) -> Self {
+        Self {
+            topology,
+            rules,
+            catalog,
+            players,
+            pawns,
+            shared_pile,
+            current_player,
+            audits_this_turn: 0,
+            forfeited_next_turn: HashSet::new(),
+            pending_forfeit: None,
+            space_effects: HashMap::new(),
+        }
+    }
+
+    fn player_index(&self, id: PlayerId) -> Result<usize, GameError> {
+        self.players
+            .iter()
+            .position(|player| player.id == id)
+            .ok_or(GameError::UnknownPlayer(id))
+    }
+
+    fn resolve_auditee(&self, target_pawn: PawnId) -> Result<PlayerId, GameError> {
+        let pawn = self
+            .pawns
+            .iter()
+            .find(|pawn| pawn.id == target_pawn)
+            .ok_or(GameError::UnknownPawn(target_pawn))?;
+        self.players
+            .iter()
+            .find(|player| player.color == pawn.owner)
+            .map(|player| player.id)
+            .ok_or(GameError::Audit(AuditError::UnknownAuditee(target_pawn)))
+    }
+
+    /// Adds `card` to `player`'s hand if under `hand_hard_cap`, else their
+    /// reserve (checked against `deck_cap`), else the shared pile — the
+    /// standard chain for any external inflow.
+    fn give_card_to_player(
+        &mut self,
+        player: PlayerId,
+        card: CardKindId,
+        overflow_source: PileSource,
+        events: &mut Vec<GameEvent>,
+    ) {
+        let idx = self
+            .player_index(player)
+            .expect("caller ensures player exists");
+        if self.players[idx].hand.len() < self.rules.hand_hard_cap as usize {
+            self.players[idx].hand.push(card);
+        } else if let Some(overflowed) =
+            self.players[idx]
+                .deck
+                .give(card, self.rules.deck_cap, false)
+        {
+            self.shared_pile.add(overflowed);
+            events.push(GameEvent::CardsEnteredPile {
+                cards: vec![overflowed],
+                source: overflow_source,
+            });
+        }
+    }
+
+    /// Returns `card` straight to `player`'s reserve (never their hand) —
+    /// for history resolving naturally, not an external windfall.
+    fn return_card_to_reserve(
+        &mut self,
+        player: PlayerId,
+        card: CardKindId,
+        bypass_cap: bool,
+        overflow_source: PileSource,
+        events: &mut Vec<GameEvent>,
+    ) {
+        let idx = self
+            .player_index(player)
+            .expect("caller ensures player exists");
+        if let Some(overflowed) = self.players[idx]
+            .deck
+            .give(card, self.rules.deck_cap, bypass_cap)
+        {
+            self.shared_pile.add(overflowed);
+            events.push(GameEvent::CardsEnteredPile {
+                cards: vec![overflowed],
+                source: overflow_source,
+            });
+        }
+    }
+
+    /// Removes `count` cards from `player`'s hand per `selection`.
+    /// `PayerChooses` requires exactly `count` cards named in `chosen`,
+    /// each of which must genuinely be in hand. `RandomDraft` ignores
+    /// `chosen` and draws uniformly at random, taking fewer if the hand is
+    /// short (never an error, matching `Deck`/`SharedPile`'s own contract).
+    fn take_payment_from_hand(
+        &mut self,
+        player: PlayerId,
+        count: u8,
+        selection: PaymentSelectionMode,
+        chosen: &[CardKindId],
+    ) -> Result<Vec<CardKindId>, GameError> {
+        let idx = self.player_index(player)?;
+        match selection {
+            PaymentSelectionMode::PayerChooses => {
+                if chosen.len() != count as usize {
+                    return Err(GameError::InvalidPaymentSelection {
+                        expected: count,
+                        actual: chosen.len(),
+                    });
+                }
+                let mut hand = self.players[idx].hand.clone();
+                let mut taken = Vec::with_capacity(chosen.len());
+                for &card in chosen {
+                    let pos = hand
+                        .iter()
+                        .position(|&c| c == card)
+                        .ok_or(GameError::CardNotInHand(card))?;
+                    hand.remove(pos);
+                    taken.push(card);
+                }
+                self.players[idx].hand = hand;
+                Ok(taken)
+            }
+            PaymentSelectionMode::RandomDraft => {
+                let mut rng = rand::rng();
+                let hand = &mut self.players[idx].hand;
+                let n = (count as usize).min(hand.len());
+                let mut taken = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let i = rng.random_range(0..hand.len());
+                    taken.push(hand.swap_remove(i));
+                }
+                Ok(taken)
+            }
+        }
+    }
+
+    /// Sends a payment to wherever `destination` specifies, applying the
+    /// usual hand → deck → pile overflow chain if it's headed to a player.
+    fn route_payment(
+        &mut self,
+        payer: PlayerId,
+        cards: Vec<CardKindId>,
+        destination: CardDestination,
+        auditee: PlayerId,
+        overflow_source: PileSource,
+        events: &mut Vec<GameEvent>,
+    ) {
+        if cards.is_empty() {
+            return;
+        }
+        match destination {
+            CardDestination::SharedPile => {
+                for &card in &cards {
+                    self.shared_pile.add(card);
+                }
+                events.push(GameEvent::CardsEnteredPile {
+                    cards,
+                    source: overflow_source,
+                });
+            }
+            CardDestination::Auditee => {
+                for &card in &cards {
+                    self.give_card_to_player(auditee, card, overflow_source, events);
+                }
+                events.push(GameEvent::CardsTransferred {
+                    from: payer,
+                    to: auditee,
+                    cards,
+                });
+            }
+        }
+    }
+
+    /// Draws up to `count` cards from the shared pile straight into
+    /// `player`'s hand (via the usual overflow chain) — the capture reward
+    /// and `NoAvailableActionBehavior::DrawCard` lifeline both work this
+    /// way.
+    fn grant_cards_from_pile(&mut self, player: PlayerId, count: u8, events: &mut Vec<GameEvent>) {
+        if count == 0 {
+            return;
+        }
+        let mut rng = rand::rng();
+        let drawn = self.shared_pile.take(count, &mut rng);
+        if drawn.is_empty() {
+            return;
+        }
+        events.push(GameEvent::CardsGrantedFromPile {
+            player,
+            count: drawn.len(),
+        });
+        for card in drawn {
+            self.give_card_to_player(player, card, PileSource::GrantBounceback, events);
+        }
+    }
+
+    /// Tops `player`'s hand back up to `hand_soft_cap` from their own
+    /// reserve — the only routine draw, at the end of their turn.
+    fn end_of_turn_draw(&mut self, player: PlayerId) {
+        let idx = self
+            .player_index(player)
+            .expect("caller ensures player exists");
+        let hand_len = self.players[idx].hand.len();
+        let target = self.rules.hand_soft_cap as usize;
+        if hand_len >= target {
+            return;
+        }
+        let need = (target - hand_len) as u8;
+        let mut rng = rand::rng();
+        let drawn = self.players[idx].deck.take(need, &mut rng);
+        self.players[idx].hand.extend(drawn);
+    }
+
+    /// Advances `current_player` to the next player in turn order, skipping
+    /// anyone who currently owes a forfeited turn (`StunTrapCard`).
+    fn advance_turn(&mut self) {
+        let player_count = self.players.len();
+        if player_count == 0 {
+            return;
+        }
+        let current_idx = self
+            .players
+            .iter()
+            .position(|player| player.id == self.current_player)
+            .unwrap_or(0);
+        let mut next_idx = (current_idx + 1) % player_count;
+        for _ in 0..player_count {
+            let candidate = self.players[next_idx].id;
+            if self.forfeited_next_turn.remove(&candidate) {
+                next_idx = (next_idx + 1) % player_count;
+                continue;
+            }
+            break;
+        }
+        self.current_player = self.players[next_idx].id;
+    }
+
+    fn apply_play_card(&mut self, played: PlayedCard) -> Result<Vec<GameEvent>, GameError> {
+        if self.pending_forfeit.is_some() {
+            return Err(GameError::PendingForfeitOwed);
+        }
+
+        let claimed = played.declaration.claimed_cards.clone();
+        let actual = played.actual_cards.clone();
+
+        if !self.rules.allow_card_count_mismatch && claimed.len() != actual.len() {
+            return Err(GameError::CardCountMismatch {
+                claimed: claimed.len(),
+                actual: actual.len(),
+            });
+        }
+        if claimed.len() > self.rules.max_cards_per_play as usize {
+            return Err(GameError::TooManyCards {
+                max: self.rules.max_cards_per_play,
+                actual: claimed.len(),
+            });
+        }
+        let mut claimed_counts: HashMap<CardCategory, u8> = HashMap::new();
+        for &id in &claimed {
+            if let Some(meta) = self.catalog.get(id) {
+                *claimed_counts.entry(meta.category).or_insert(0) += 1;
+            }
+        }
+        for (category, &max) in &self.rules.max_cards_per_category_per_play {
+            let count = claimed_counts.get(category).copied().unwrap_or(0);
+            if count > max {
+                return Err(GameError::TooManyOfCategory {
+                    category: *category,
+                    max,
+                    actual: count as usize,
+                });
+            }
+        }
+
+        let pawn_id = played.declaration.pawn;
+        let pawn_index = self
+            .pawns
+            .iter()
+            .position(|pawn| pawn.id == pawn_id)
+            .ok_or(GameError::UnknownPawn(pawn_id))?;
+        let owner_color = self.pawns[pawn_index].owner;
+        let pawn_owner_id = self
+            .players
+            .iter()
+            .find(|player| player.color == owner_color)
+            .map(|player| player.id)
+            .ok_or(GameError::UnknownPawn(pawn_id))?;
+        if pawn_owner_id != self.current_player {
+            return Err(GameError::NotYourPawn {
+                pawn: pawn_id,
+                player: self.current_player,
+            });
+        }
+        let acting_player = self.current_player;
+        let player_idx = self.player_index(acting_player)?;
+
+        // The actual cards must genuinely be in hand — the claim can say
+        // anything, but what's truly consumed can't be fabricated.
+        {
+            let mut hand = self.players[player_idx].hand.clone();
+            for &card in &actual {
+                let pos = hand
+                    .iter()
+                    .position(|&c| c == card)
+                    .ok_or(GameError::CardNotInHand(card))?;
+                hand.remove(pos);
+            }
+            self.players[player_idx].hand = hand;
+        }
+
+        let position_before = self.pawns[pawn_index].position;
+        let was_in_yard = self.topology.node(position_before)?.kind == SpaceKind::Yard;
+
+        let mut events = vec![GameEvent::CardConsumed {
+            player: acting_player,
+        }];
+
+        let (captures_caused, ctx_events) = {
+            let mut proposal = MovementProposal::default();
+            let mut ctx = PlayContext::new(
+                &self.topology,
+                &self.rules,
+                &self.catalog,
+                &mut self.pawns,
+                &mut self.space_effects,
+                pawn_id,
+            );
+            for &card_id in &actual {
+                ctx.begin_card(card_id);
+                if let Some(meta) = self.catalog.get(card_id) {
+                    meta.behavior.on_played(&mut ctx);
+                }
+            }
+            for &card_id in &claimed {
+                ctx.begin_card(card_id);
+                if let Some(meta) = self.catalog.get(card_id) {
+                    meta.behavior.on_claimed(&mut ctx, &mut proposal);
+                }
+            }
+            let captures = ctx.resolve_movement(proposal)?;
+            (captures, ctx.into_events())
+        };
+        events.extend(ctx_events);
+
+        let position_after = self.pawns[pawn_index].position;
+
+        if was_in_yard {
+            let aged = self.pawns[pawn_index].clear_history_on_exit();
+            for card in aged {
+                self.return_card_to_reserve(
+                    acting_player,
+                    card,
+                    self.rules.aged_out_exempt_from_deck_cap,
+                    PileSource::AgedOutOverflow,
+                    &mut events,
+                );
+            }
+        }
+
+        let record = MoveRecord {
+            claimed_cards: claimed,
+            actual_cards: actual,
+            position_before,
+            position_after,
+            captures_caused: captures_caused.clone(),
+            reveal: RevealScope::Hidden,
+        };
+        if let Some(aged_out) =
+            self.pawns[pawn_index].push_move(record, self.rules.audit_window as usize)
+        {
+            for card in aged_out.actual_cards {
+                self.return_card_to_reserve(
+                    acting_player,
+                    card,
+                    self.rules.aged_out_exempt_from_deck_cap,
+                    PileSource::AgedOutOverflow,
+                    &mut events,
+                );
+            }
+        }
+
+        if self.rules.finished_pawn_dumps_history_destination
+            && self.topology.node(position_after)?.kind == SpaceKind::Finish
+        {
+            let dumped = self.pawns[pawn_index].collect_early_forfeiting_reinstatement();
+            if !dumped.is_empty() {
+                for &card in &dumped {
+                    self.shared_pile.add(card);
+                }
+                events.push(GameEvent::CardsEnteredPile {
+                    cards: dumped,
+                    source: PileSource::CapturedPawnFinished,
+                });
+            }
+        }
+
+        for &(captured_pawn, _position) in &captures_caused {
+            events.push(GameEvent::PawnCaptured {
+                pawn: captured_pawn,
+                by: pawn_id,
+            });
+            self.grant_cards_from_pile(
+                acting_player,
+                self.rules.capture_reward_from_pile,
+                &mut events,
+            );
+        }
+
+        self.end_of_turn_draw(acting_player);
+        self.advance_turn();
+
+        Ok(events)
+    }
+
+    fn apply_audit(&mut self, request: AuditRequest) -> Result<Vec<GameEvent>, GameError> {
+        if self.pending_forfeit.is_some() {
+            return Err(GameError::PendingForfeitOwed);
+        }
+        if request.auditor != self.current_player {
+            return Err(GameError::NotYourTurn(request.auditor));
+        }
+        if self.audits_this_turn >= self.rules.max_audits_per_turn {
+            return Err(GameError::TooManyAudits {
+                max: self.rules.max_audits_per_turn,
+            });
+        }
+
+        let auditee = self.resolve_auditee(request.target_pawn)?;
+        let mut events = Vec::new();
+
+        if self.rules.audit_attempt_cost > 0 {
+            let paid = self.take_payment_from_hand(
+                request.auditor,
+                self.rules.audit_attempt_cost,
+                self.rules.audit_attempt_cost_selection,
+                &request.attempt_cost_cards,
+            )?;
+            self.route_payment(
+                request.auditor,
+                paid,
+                self.rules.audit_attempt_cost_destination,
+                auditee,
+                PileSource::AuditAttemptCostOverflow,
+                &mut events,
+            );
+        }
+        self.audits_this_turn += 1;
+
+        let resolution = audit::resolve(
+            &request,
+            &self.catalog,
+            &self.topology,
+            &self.rules,
+            &self.players,
+            &mut self.pawns,
+        )?;
+
+        events.push(GameEvent::AuditResolved {
+            auditor: request.auditor,
+            target_pawn: request.target_pawn,
+            target_move_index: request.target_move_index,
+            outcome: resolution.outcome,
+        });
+
+        match resolution.consequence {
+            AuditConsequence::FalseAccusation => {
+                if self.rules.false_accusation_card_cost > 0 {
+                    match self.rules.false_accusation_selection {
+                        PaymentSelectionMode::RandomDraft => {
+                            let paid = self.take_payment_from_hand(
+                                request.auditor,
+                                self.rules.false_accusation_card_cost,
+                                PaymentSelectionMode::RandomDraft,
+                                &[],
+                            )?;
+                            self.route_payment(
+                                request.auditor,
+                                paid,
+                                self.rules.false_accusation_destination,
+                                auditee,
+                                PileSource::FalseAccusationOverflow,
+                                &mut events,
+                            );
+                        }
+                        PaymentSelectionMode::PayerChooses => {
+                            let target = match self.rules.false_accusation_destination {
+                                CardDestination::SharedPile => PaymentTarget::SharedPile,
+                                CardDestination::Auditee => PaymentTarget::Player(auditee),
+                            };
+                            self.pending_forfeit = Some(PendingForfeit {
+                                owed_by: request.auditor,
+                                target,
+                                remaining: self.rules.false_accusation_card_cost,
+                            });
+                        }
+                    }
+                }
+            }
+            AuditConsequence::LieCaught(revert) => {
+                // Reinstated captures' position changes are already applied
+                // by audit::resolve; no dedicated event exists to describe
+                // them (GameEvent has no "reinstated" variant), so they're
+                // not separately logged here — a known gap, not a state bug.
+                if !revert.directly_audited_cards.is_empty() {
+                    for &card in &revert.directly_audited_cards {
+                        self.give_card_to_player(
+                            request.auditor,
+                            card,
+                            PileSource::CascadedAuditSpoils,
+                            &mut events,
+                        );
+                    }
+                    events.push(GameEvent::CardsTransferred {
+                        from: auditee,
+                        to: request.auditor,
+                        cards: revert.directly_audited_cards,
+                    });
+                }
+                if !revert.swept_up_cards.is_empty() {
+                    if self.rules.cascade_lie_rewards_destination {
+                        for &card in &revert.swept_up_cards {
+                            self.shared_pile.add(card);
+                        }
+                        events.push(GameEvent::CardsEnteredPile {
+                            cards: revert.swept_up_cards,
+                            source: PileSource::CascadedAuditSpoils,
+                        });
+                    } else {
+                        for &card in &revert.swept_up_cards {
+                            self.give_card_to_player(
+                                request.auditor,
+                                card,
+                                PileSource::CascadedAuditSpoils,
+                                &mut events,
+                            );
+                        }
+                        events.push(GameEvent::CardsTransferred {
+                            from: auditee,
+                            to: request.auditor,
+                            cards: revert.swept_up_cards,
+                        });
+                    }
+                }
+            }
+        }
+
+        if resolution.forfeits_auditor_turn {
+            self.forfeited_next_turn.insert(request.auditor);
+            events.push(GameEvent::TurnForfeited {
+                player: request.auditor,
+            });
+        }
+
+        Ok(events)
+    }
+
+    fn apply_forfeit_card(&mut self, card: CardKindId) -> Result<Vec<GameEvent>, GameError> {
+        let Some(pending) = self.pending_forfeit else {
+            return Err(GameError::NoPendingForfeit);
+        };
+        if pending.owed_by != self.current_player {
+            return Err(GameError::NotYourTurn(pending.owed_by));
+        }
+        let idx = self.player_index(pending.owed_by)?;
+        let pos = self.players[idx]
+            .hand
+            .iter()
+            .position(|&c| c == card)
+            .ok_or(GameError::CardNotInHand(card))?;
+        self.players[idx].hand.remove(pos);
+
+        let mut events = Vec::new();
+        match pending.target {
+            PaymentTarget::SharedPile => {
+                self.shared_pile.add(card);
+                events.push(GameEvent::CardsEnteredPile {
+                    cards: vec![card],
+                    source: PileSource::FalseAccusationOverflow,
+                });
+            }
+            PaymentTarget::Player(to) => {
+                self.give_card_to_player(
+                    to,
+                    card,
+                    PileSource::FalseAccusationOverflow,
+                    &mut events,
+                );
+                events.push(GameEvent::CardsTransferred {
+                    from: pending.owed_by,
+                    to,
+                    cards: vec![card],
+                });
+            }
+        }
+
+        let remaining = pending.remaining - 1;
+        self.pending_forfeit = if remaining == 0 {
+            None
+        } else {
+            Some(PendingForfeit {
+                remaining,
+                ..pending
+            })
+        };
+
+        Ok(events)
+    }
+}
+
+impl GameEngine for GameState {
+    fn legal_actions(&self, player: PlayerId) -> Vec<TurnAction> {
+        if let Some(pending) = self.pending_forfeit {
+            if pending.owed_by != player {
+                return Vec::new();
+            }
+            let Ok(idx) = self.player_index(player) else {
+                return Vec::new();
+            };
+            return self.players[idx]
+                .hand
+                .iter()
+                .copied()
+                .map(TurnAction::ForfeitCard)
+                .collect();
+        }
+        if player != self.current_player {
+            return Vec::new();
+        }
+        let Ok(idx) = self.player_index(player) else {
+            return Vec::new();
+        };
+        let hand = self.players[idx].hand.clone();
+        let color = self.players[idx].color;
+
+        let mut actions = Vec::new();
+
+        let combos = honest_combos(&hand, &self.catalog, &self.rules);
+        for pawn in self.pawns.iter().filter(|pawn| pawn.owner == color) {
+            let Ok(node) = self.topology.node(pawn.position) else {
+                continue;
+            };
+            if node.kind == SpaceKind::Finish {
+                continue;
+            }
+            let is_in_yard = node.kind == SpaceKind::Yard;
+            for combo in &combos {
+                if is_in_yard
+                    && let ExitRule::RequiresCard(required) = self.rules.exit_rule
+                    && !combo.contains(&required)
+                {
+                    continue;
+                }
+                actions.push(TurnAction::PlayCard(PlayedCard {
+                    declaration: Declaration {
+                        pawn: pawn.id,
+                        claimed_cards: combo.clone(),
+                    },
+                    actual_cards: combo.clone(),
+                }));
+            }
+        }
+
+        if self.audits_this_turn < self.rules.max_audits_per_turn {
+            let worst_case = self.rules.audit_attempt_cost as usize
+                + self.rules.false_accusation_card_cost as usize;
+            if hand.len() >= worst_case {
+                for pawn in self.pawns.iter().filter(|pawn| pawn.owner != color) {
+                    if !self.rules.captured_pawns_remain_auditable
+                        && let Ok(node) = self.topology.node(pawn.position)
+                        && node.kind == SpaceKind::Yard
+                    {
+                        continue;
+                    }
+                    for (index, _) in pawn.auditable_moves() {
+                        let attempt_cost_cards = match self.rules.audit_attempt_cost_selection {
+                            PaymentSelectionMode::PayerChooses
+                                if self.rules.audit_attempt_cost > 0 =>
+                            {
+                                hand.iter()
+                                    .take(self.rules.audit_attempt_cost as usize)
+                                    .copied()
+                                    .collect()
+                            }
+                            _ => Vec::new(),
+                        };
+                        actions.push(TurnAction::Audit(AuditRequest {
+                            auditor: player,
+                            target_pawn: pawn.id,
+                            target_move_index: index,
+                            attempt_cost_cards,
+                        }));
+                    }
+                }
+            }
+        }
+
+        actions
+    }
+
+    fn apply(&mut self, action: TurnAction) -> Result<Vec<GameEvent>, GameError> {
+        match action {
+            TurnAction::Audit(request) => self.apply_audit(request),
+            TurnAction::ForfeitCard(card) => self.apply_forfeit_card(card),
+            TurnAction::PlayCard(played) => self.apply_play_card(played),
+        }
+    }
+
+    fn view_for(&self, player: PlayerId) -> GameView {
+        view::build(&self.rules, &self.players, &self.pawns, player)
+    }
+
+    fn current_player(&self) -> PlayerId {
+        self.current_player
+    }
+}
+
+/// Every distinct "honest" (claimed == actual) card combination in `hand`,
+/// from size 1 up to `rules.max_cards_per_play`, respecting
+/// `rules.max_cards_per_category_per_play`. Duplicate-looking combinations
+/// (same multiset of ids, different underlying hand slots) are deduplicated.
+fn honest_combos(
+    hand: &[CardKindId],
+    catalog: &CardCatalog,
+    rules: &RuleConfig,
+) -> Vec<Vec<CardKindId>> {
+    let max_k = (rules.max_cards_per_play as usize).min(hand.len());
+    let mut seen: HashSet<Vec<u16>> = HashSet::new();
+    let mut combos = Vec::new();
+    for k in 1..=max_k {
+        for indices in index_combinations(hand.len(), k) {
+            let combo: Vec<CardKindId> = indices.iter().map(|&i| hand[i]).collect();
+            let mut counts: HashMap<CardCategory, u8> = HashMap::new();
+            for &id in &combo {
+                if let Some(meta) = catalog.get(id) {
+                    *counts.entry(meta.category).or_insert(0) += 1;
+                }
+            }
+            let within_limits = counts.iter().all(|(category, count)| {
+                rules
+                    .max_cards_per_category_per_play
+                    .get(category)
+                    .is_none_or(|&max| *count <= max)
+            });
+            if !within_limits {
+                continue;
+            }
+            let mut key: Vec<u16> = combo.iter().map(|c| c.0).collect();
+            key.sort_unstable();
+            if seen.insert(key) {
+                combos.push(combo);
+            }
+        }
+    }
+    combos
+}
+
+/// Every `k`-combination of indices `0..n`, in lexicographic order.
+fn index_combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
+    if k == 0 || k > n {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut current = Vec::with_capacity(k);
+    fn helper(
+        start: usize,
+        n: usize,
+        k: usize,
+        current: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        if current.len() == k {
+            out.push(current.clone());
+            return;
+        }
+        for i in start..n {
+            current.push(i);
+            helper(i + 1, n, k, current, out);
+            current.pop();
+        }
+    }
+    helper(0, n, k, &mut current, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::{NextSpace, PlayerColor};
+    use crate::card::AuditOutcome;
+    use crate::deck::{Deck, DeckComposition};
+    use crate::pawn::tests::bare_pawn;
+    use crate::rules::minimal_rules;
+
+    fn board() -> BoardTopology {
+        BoardTopology::standard_ring(2, 8, 3, 2).unwrap()
+    }
+
+    /// A longer ring, for tests walking far enough that an 8-space ring's
+    /// fork would otherwise get in the way.
+    fn large_board() -> BoardTopology {
+        BoardTopology::standard_ring(2, 24, 3, 2).unwrap()
+    }
+
+    fn empty_deck() -> Deck {
+        Deck::new(&DeckComposition { counts: Vec::new() })
+    }
+
+    fn player(id: u32, color: u8, hand: Vec<CardKindId>) -> Player {
+        Player {
+            id: PlayerId(id),
+            color: PlayerColor(color),
+            hand,
+            deck: empty_deck(),
+            score: 0,
+        }
+    }
+
+    fn entry_of(topology: &BoardTopology, color: PlayerColor) -> SpaceId {
+        let yard = topology.yard_spaces(color)[0];
+        match topology.next_space(yard, color).unwrap() {
+            NextSpace::Single(space) => space,
+            other => panic!("expected a single yard exit edge, got {other:?}"),
+        }
+    }
+
+    fn steps_from(topology: &BoardTopology, color: PlayerColor, from: SpaceId, n: u32) -> SpaceId {
+        let mut here = from;
+        for _ in 0..n {
+            here = match topology.next_space(here, color).unwrap() {
+                NextSpace::Single(space) => space,
+                other => panic!("expected a single ring step, got {other:?}"),
+            };
+        }
+        here
+    }
+
+    #[test]
+    fn playing_a_card_moves_the_pawn_consumes_it_and_advances_the_turn() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let expected = steps_from(&topology, PlayerColor(0), entry0, 1);
+        let players = vec![
+            player(0, 0, vec![CardKindId(0), CardKindId(4)]),
+            player(1, 1, vec![CardKindId(1)]),
+        ];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::PawnMoved {
+                pawn: PawnId(0),
+                ..
+            }
+        )));
+        assert_eq!(state.pawns[0].position, expected);
+        assert_eq!(state.players[0].hand, vec![CardKindId(4)]);
+        assert_eq!(state.current_player, PlayerId(1));
+    }
+
+    #[test]
+    fn bluffed_claim_moves_the_pawn_by_the_claimed_distance_not_the_real_one() {
+        let topology = large_board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let expected = steps_from(&topology, PlayerColor(0), entry0, 8);
+        let players = vec![
+            player(
+                0,
+                0,
+                vec![CardKindId(3), CardKindId(4), CardKindId(0), CardKindId(6)],
+            ),
+            player(1, 1, Vec::new()),
+        ];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(3), CardKindId(4)],
+                },
+                actual_cards: vec![CardKindId(0), CardKindId(6)],
+            }))
+            .unwrap();
+
+        assert_eq!(state.pawns[0].position, expected);
+        assert_eq!(state.pawns[0].auditable_moves().count(), 1);
+        let (_, record) = state.pawns[0].auditable_moves().next().unwrap();
+        assert_eq!(record.claimed_cards, vec![CardKindId(3), CardKindId(4)]);
+        assert_eq!(record.actual_cards, vec![CardKindId(0), CardKindId(6)]);
+        // Only the truly-played cards left the hand.
+        let mut hand = state.players[0].hand.clone();
+        hand.sort_by_key(|c| c.0);
+        assert_eq!(hand, vec![CardKindId(3), CardKindId(4)]);
+    }
+
+    #[test]
+    fn auditing_a_caught_lie_reverts_the_pawn_and_rewards_the_auditor() {
+        let topology = large_board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let players = vec![
+            player(
+                0,
+                0,
+                vec![CardKindId(3), CardKindId(4), CardKindId(0), CardKindId(6)],
+            ),
+            player(1, 1, Vec::new()),
+        ];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(3), CardKindId(4)],
+                },
+                actual_cards: vec![CardKindId(0), CardKindId(6)],
+            }))
+            .unwrap();
+
+        let events = state
+            .apply(TurnAction::Audit(AuditRequest {
+                auditor: PlayerId(1),
+                target_pawn: PawnId(0),
+                target_move_index: 0,
+                attempt_cost_cards: Vec::new(),
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::AuditResolved {
+                outcome: AuditOutcome::LieCaught,
+                ..
+            }
+        )));
+        assert_eq!(state.pawns[0].position, entry0);
+        assert_eq!(state.pawns[0].auditable_moves().count(), 0);
+        let mut hand = state.players[1].hand.clone();
+        hand.sort_by_key(|c| c.0);
+        assert_eq!(hand, vec![CardKindId(0), CardKindId(6)]);
+    }
+
+    #[test]
+    fn false_accusation_with_random_draft_pays_immediately_and_leaves_no_pending_forfeit() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(1), CardKindId(2)]),
+        ];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        let events = state
+            .apply(TurnAction::Audit(AuditRequest {
+                auditor: PlayerId(1),
+                target_pawn: PawnId(0),
+                target_move_index: 0,
+                attempt_cost_cards: Vec::new(),
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::AuditResolved {
+                outcome: AuditOutcome::ClaimWasTrue,
+                ..
+            }
+        )));
+        assert_eq!(state.players[1].hand.len(), 1);
+        assert!(state.pending_forfeit.is_none());
+    }
+
+    #[test]
+    fn false_accusation_with_payer_chooses_creates_a_pending_forfeit_that_clears_on_submission() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let rules = RuleConfig {
+            false_accusation_selection: PaymentSelectionMode::PayerChooses,
+            ..minimal_rules()
+        };
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(1), CardKindId(2)]),
+        ];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+        state
+            .apply(TurnAction::Audit(AuditRequest {
+                auditor: PlayerId(1),
+                target_pawn: PawnId(0),
+                target_move_index: 0,
+                attempt_cost_cards: Vec::new(),
+            }))
+            .unwrap();
+
+        assert!(state.pending_forfeit.is_some());
+        let legal = state.legal_actions(PlayerId(1));
+        assert_eq!(legal.len(), 2);
+        assert!(
+            legal
+                .iter()
+                .all(|action| matches!(action, TurnAction::ForfeitCard(_)))
+        );
+
+        let to_forfeit = state.players[1].hand[0];
+        state.apply(TurnAction::ForfeitCard(to_forfeit)).unwrap();
+
+        assert!(state.pending_forfeit.is_none());
+        assert!(state.players[0].hand.contains(&to_forfeit));
+        assert!(!state.players[1].hand.contains(&to_forfeit));
+    }
+
+    #[test]
+    fn pending_forfeit_blocks_every_other_action() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let rules = RuleConfig {
+            false_accusation_selection: PaymentSelectionMode::PayerChooses,
+            ..minimal_rules()
+        };
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(1)]),
+        ];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+        state
+            .apply(TurnAction::Audit(AuditRequest {
+                auditor: PlayerId(1),
+                target_pawn: PawnId(0),
+                target_move_index: 0,
+                attempt_cost_cards: Vec::new(),
+            }))
+            .unwrap();
+
+        let err = state
+            .apply(TurnAction::Audit(AuditRequest {
+                auditor: PlayerId(1),
+                target_pawn: PawnId(0),
+                target_move_index: 0,
+                attempt_cost_cards: Vec::new(),
+            }))
+            .unwrap_err();
+        assert!(matches!(err, GameError::PendingForfeitOwed));
+    }
+
+    #[test]
+    fn capturing_a_pawn_sends_it_to_yard_and_grants_a_reward() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let landing = steps_from(&topology, PlayerColor(0), entry0, 1);
+        let players = vec![player(0, 0, vec![CardKindId(0)]), player(1, 1, Vec::new())];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), entry0),
+            bare_pawn(PawnId(1), PlayerColor(1), landing),
+        ];
+        let shared_pile = SharedPile::new(vec![CardKindId(9); 5]);
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            shared_pile,
+            PlayerId(0),
+        );
+
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::PawnCaptured {
+                pawn: PawnId(1),
+                by: PawnId(0)
+            }
+        )));
+        assert_eq!(
+            state.pawns[1].position,
+            state.topology.yard_spaces(PlayerColor(1))[0]
+        );
+        assert_eq!(state.players[0].hand.len(), 2);
+    }
+
+    #[test]
+    fn legal_actions_enumerates_honest_plays_and_eligible_audits() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let entry1 = entry_of(&topology, PlayerColor(1));
+        let players = vec![
+            player(0, 0, vec![CardKindId(0), CardKindId(4)]),
+            player(1, 1, Vec::new()),
+        ];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), entry0),
+            bare_pawn(PawnId(1), PlayerColor(1), entry1),
+        ];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+        state.pawns[1].push_move(
+            MoveRecord {
+                claimed_cards: vec![CardKindId(1)],
+                actual_cards: vec![CardKindId(1)],
+                position_before: entry1,
+                position_after: entry1,
+                captures_caused: Vec::new(),
+                reveal: RevealScope::Hidden,
+            },
+            3,
+        );
+
+        let legal = state.legal_actions(PlayerId(0));
+        let play_count = legal
+            .iter()
+            .filter(|action| matches!(action, TurnAction::PlayCard(_)))
+            .count();
+        let audit_count = legal
+            .iter()
+            .filter(|action| matches!(action, TurnAction::Audit(_)))
+            .count();
+
+        assert_eq!(play_count, 3); // [Take1], [Double], [Take1, Double]
+        assert_eq!(audit_count, 1);
+    }
+
+    #[test]
+    fn legal_actions_is_empty_for_a_player_who_isnt_current() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let entry1 = entry_of(&topology, PlayerColor(1));
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(1)]),
+        ];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), entry0),
+            bare_pawn(PawnId(1), PlayerColor(1), entry1),
+        ];
+        let state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        assert!(state.legal_actions(PlayerId(1)).is_empty());
+    }
+
+    #[test]
+    fn playing_someone_elses_pawn_is_an_error() {
+        let topology = board();
+        let entry1 = entry_of(&topology, PlayerColor(1));
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(1)]),
+        ];
+        let pawns = vec![bare_pawn(PawnId(1), PlayerColor(1), entry1)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        let err = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(1),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            GameError::NotYourPawn {
+                pawn: PawnId(1),
+                player: PlayerId(0)
+            }
+        ));
+    }
+
+    #[test]
+    fn claiming_a_card_not_in_hand_is_an_error() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let players = vec![player(0, 0, Vec::new()), player(1, 1, Vec::new())];
+        let pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        let err = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap_err();
+
+        assert!(matches!(err, GameError::CardNotInHand(CardKindId(0))));
+    }
+}

@@ -4,6 +4,7 @@ pub mod card;
 pub mod context;
 pub mod deck;
 pub mod event;
+pub mod game;
 pub mod movement;
 pub mod pawn;
 pub mod play;
