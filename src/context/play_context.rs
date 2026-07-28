@@ -9,7 +9,8 @@ use crate::context::InteractionContext;
 use crate::event::GameEvent;
 use crate::movement::{self, MoveError};
 use crate::pawn::{
-    ClaimedEffectState, EffectAnchor, ExpiryCondition, Pawn, PawnId, PersistentEffectState,
+    AutomaticAuditCatch, ClaimedEffectState, EffectAnchor, ExpiryCondition, Pawn, PawnId,
+    PersistentEffectState,
 };
 use crate::rules::RuleConfig;
 
@@ -49,6 +50,15 @@ pub enum CaptureOutcome {
     Blocked,
 }
 
+/// Everything a resolved play produced, once `PlayContext` is done with
+/// it: the event log, plus any automatic-audit catches for the caller
+/// (`GameState`) to route into the wider card economy.
+#[derive(Default)]
+pub struct PlayOutcome {
+    pub events: Vec<GameEvent>,
+    pub automatic_audit_catches: Vec<AutomaticAuditCatch>,
+}
+
 /// The context a card's `on_played`/`on_claimed` hooks act through: it can
 /// resolve movement, attempt captures, attach persistent effects, and log
 /// events, but nothing else.
@@ -64,6 +74,9 @@ pub struct PlayContext<'a> {
     /// `attach_claimed_effect` so they know what to attribute the effect to.
     current_card: Option<CardKindId>,
     events: Vec<GameEvent>,
+    /// Every automatic-audit catch recorded while resolving this play —
+    /// see `PlayOutcome`.
+    automatic_audit_catches: Vec<AutomaticAuditCatch>,
 }
 
 impl<'a> PlayContext<'a> {
@@ -86,6 +99,7 @@ impl<'a> PlayContext<'a> {
             mover,
             current_card: None,
             events: Vec::new(),
+            automatic_audit_catches: Vec::new(),
         }
     }
 
@@ -202,6 +216,7 @@ impl<'a> PlayContext<'a> {
                 self.rules,
                 self.pawns,
                 &mut self.events,
+                &mut self.automatic_audit_catches,
             );
             for effect in &persistent {
                 if let Some(meta) = self.catalog.get(effect.source_card)
@@ -295,12 +310,15 @@ impl<'a> PlayContext<'a> {
         self.events.push(event);
     }
 
-    /// Consumes this context, returning every event it accumulated —
-    /// `PlayContext` doesn't have a way to hand game state its log
+    /// Consumes this context, returning everything it accumulated —
+    /// `PlayContext` doesn't have a way to hand game state its results
     /// incrementally, so the caller drains it once the play is fully
     /// resolved.
-    pub fn into_events(self) -> Vec<GameEvent> {
-        self.events
+    pub fn into_outcome(self) -> PlayOutcome {
+        PlayOutcome {
+            events: self.events,
+            automatic_audit_catches: self.automatic_audit_catches,
+        }
     }
 }
 

@@ -3,7 +3,7 @@
 
 use crate::board::BoardTopology;
 use crate::event::GameEvent;
-use crate::pawn::{self, Pawn, PawnId};
+use crate::pawn::{self, AutomaticAuditCatch, Pawn, PawnId};
 use crate::rules::RuleConfig;
 
 /// The context a card's pass-through and capture-attempt hooks act
@@ -18,6 +18,11 @@ pub struct InteractionContext<'a> {
     rules: &'a RuleConfig,
     pawns: &'a mut Vec<Pawn>,
     events: &'a mut Vec<GameEvent>,
+    /// Where a caught automatic-audit lie gets recorded — borrowed from
+    /// whoever's accumulating them for the whole play (`PlayContext`),
+    /// since routing the resulting cards touches the wider game economy,
+    /// which this context has no reach into.
+    catches: &'a mut Vec<AutomaticAuditCatch>,
     /// Whichever of `on_capture_attempted_as_played`/`_as_claimed` calls
     /// `trigger_automatic_audit` first resolves it; the other's call, if
     /// any, is a no-op — see `trigger_automatic_audit`.
@@ -27,6 +32,10 @@ pub struct InteractionContext<'a> {
 impl<'a> InteractionContext<'a> {
     /// Builds a context for one capture attempt (or pass-through) between
     /// `attacker` and `defender`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a plain constructor threading borrowed context through is clearer here than a wrapper struct built just to dodge this lint"
+    )]
     pub fn new(
         attacker: PawnId,
         defender: PawnId,
@@ -35,6 +44,7 @@ impl<'a> InteractionContext<'a> {
         rules: &'a RuleConfig,
         pawns: &'a mut Vec<Pawn>,
         events: &'a mut Vec<GameEvent>,
+        catches: &'a mut Vec<AutomaticAuditCatch>,
     ) -> Self {
         Self {
             attacker,
@@ -44,6 +54,7 @@ impl<'a> InteractionContext<'a> {
             rules,
             pawns,
             events,
+            catches,
             automatic_audit_resolved: false,
         }
     }
@@ -59,11 +70,13 @@ impl<'a> InteractionContext<'a> {
     /// cards differ, reverts it (and reinstates anything it captured along
     /// the way, per `RuleConfig::revert_captures_on_lie`) exactly like a
     /// deliberate audit would — except nobody chose to gamble here, so no
-    /// penalty applies to either side if the claim turns out true. Either
-    /// way, clears the defender's outstanding claimed effects — the claim
-    /// has now been tested, one way or another. Idempotent per capture
-    /// attempt: whichever of `on_capture_attempted_as_played`/`_as_claimed`
-    /// calls this first resolves it; the other's call, if any, is a no-op.
+    /// penalty applies to either side if the claim turns out true. A
+    /// caught lie is recorded via `catches` rather than acted on further
+    /// here — see `AutomaticAuditCatch`. Either way, clears the defender's
+    /// outstanding claimed effects — the claim has now been tested, one
+    /// way or another. Idempotent per capture attempt: whichever of
+    /// `on_capture_attempted_as_played`/`_as_claimed` calls this first
+    /// resolves it; the other's call, if any, is a no-op.
     ///
     /// Simplification: this tests the defender's *newest* auditable move,
     /// not necessarily the specific move that attached the effect being
@@ -74,11 +87,6 @@ impl<'a> InteractionContext<'a> {
     /// out) is a bigger structural change than this step's scope. In
     /// practice a capture attempt follows shortly after the relevant
     /// claim/play, so the newest move is almost always the right one.
-    ///
-    /// Also out of scope, matching `audit::resolve`'s own scoping: routing
-    /// any collected cards to the shared pile
-    /// (`RuleConfig::automatic_audit_reward_destination`) — that's
-    /// `GameState`'s job (ARCHITECTURE.md §16 step 8).
     pub fn trigger_automatic_audit(&mut self) {
         if self.automatic_audit_resolved {
             return;
@@ -96,13 +104,18 @@ impl<'a> InteractionContext<'a> {
             return;
         };
         if is_a_lie {
-            pawn::revert(
+            let reversion = pawn::revert(
                 self.pawns,
                 self.topology,
                 target_index,
                 move_index,
                 self.rules.revert_captures_on_lie,
             );
+            self.catches.push(AutomaticAuditCatch {
+                attacker: self.attacker,
+                defender: self.defender,
+                reversion,
+            });
         }
         // The claim has now been tested, one way or another — see the doc
         // comment on `Pawn::claimed_effects`.
@@ -145,6 +158,7 @@ mod tests {
         let rules = minimal_rules();
         let mut pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0))];
         let mut events = Vec::new();
+        let mut catches = Vec::new();
         let mut ctx = InteractionContext::new(
             PawnId(1),
             PawnId(0),
@@ -153,6 +167,7 @@ mod tests {
             &rules,
             &mut pawns,
             &mut events,
+            &mut catches,
         );
         ctx.emit(GameEvent::PawnCaptured {
             pawn: PawnId(0),
@@ -162,12 +177,13 @@ mod tests {
     }
 
     #[test]
-    fn automatic_audit_reverts_the_defenders_lie() {
+    fn automatic_audit_reverts_the_defenders_lie_and_records_a_catch() {
         let topology = board();
         let rules = minimal_rules();
         let mut pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), SpaceId(6))];
         pawns[0].push_move(record(vec![9], vec![1], 5, 6), 5);
         let mut events = Vec::new();
+        let mut catches = Vec::new();
         let mut ctx = InteractionContext::new(
             PawnId(1),
             PawnId(0),
@@ -176,12 +192,20 @@ mod tests {
             &rules,
             &mut pawns,
             &mut events,
+            &mut catches,
         );
 
         ctx.trigger_automatic_audit();
 
         assert_eq!(pawns[0].position, SpaceId(5));
         assert_eq!(pawns[0].auditable_moves().count(), 0);
+        assert_eq!(catches.len(), 1);
+        assert_eq!(catches[0].attacker, PawnId(1));
+        assert_eq!(catches[0].defender, PawnId(0));
+        assert_eq!(
+            catches[0].reversion.directly_reverted_cards,
+            vec![CardKindId(1)]
+        );
     }
 
     #[test]
@@ -191,6 +215,7 @@ mod tests {
         let mut pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), SpaceId(6))];
         pawns[0].push_move(record(vec![1], vec![1], 5, 6), 5);
         let mut events = Vec::new();
+        let mut catches = Vec::new();
         let mut ctx = InteractionContext::new(
             PawnId(1),
             PawnId(0),
@@ -199,12 +224,14 @@ mod tests {
             &rules,
             &mut pawns,
             &mut events,
+            &mut catches,
         );
 
         ctx.trigger_automatic_audit();
 
         assert_eq!(pawns[0].position, SpaceId(6));
         assert_eq!(pawns[0].auditable_moves().count(), 1);
+        assert!(catches.is_empty());
     }
 
     #[test]
@@ -214,6 +241,7 @@ mod tests {
         let mut pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), SpaceId(6))];
         pawns[0].push_move(record(vec![9], vec![1], 5, 6), 5);
         let mut events = Vec::new();
+        let mut catches = Vec::new();
         let mut ctx = InteractionContext::new(
             PawnId(1),
             PawnId(0),
@@ -222,13 +250,16 @@ mod tests {
             &rules,
             &mut pawns,
             &mut events,
+            &mut catches,
         );
 
         ctx.trigger_automatic_audit();
         // A second call (as happens when both the played and claimed hooks
-        // fire) must not try to revert an already-empty history again.
+        // fire) must not try to revert an already-empty history again, and
+        // must not record a second catch for the same attempt.
         ctx.trigger_automatic_audit();
 
         assert_eq!(pawns[0].position, SpaceId(5));
+        assert_eq!(catches.len(), 1);
     }
 }

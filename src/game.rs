@@ -14,12 +14,14 @@ use crate::context::{MovementProposal, PlayContext};
 use crate::deck::SharedPile;
 use crate::event::{GameEvent, PileSource};
 use crate::movement::MoveError;
-use crate::pawn::{MoveRecord, Pawn, PawnId, PersistentEffectState, RevealScope};
+use crate::pawn::{
+    AutomaticAuditCatch, MoveRecord, Pawn, PawnId, PersistentEffectState, RevealScope,
+};
 use crate::play::{Declaration, PlayedCard};
 use crate::player::{Player, PlayerId};
 use crate::rules::{
-    CardDestination, CascadeSweepDestination, ExitRule, FinishedPawnHistoryDestination,
-    PaymentSelectionMode, RuleConfig,
+    AutomaticAuditCardDestination, CardDestination, CascadeSweepDestination, ExitRule,
+    FinishedPawnHistoryDestination, PaymentSelectionMode, RuleConfig,
 };
 use crate::view::{self, GameView};
 
@@ -157,7 +159,10 @@ impl GameState {
             .ok_or(GameError::UnknownPlayer(id))
     }
 
-    fn resolve_auditee(&self, target_pawn: PawnId) -> Result<PlayerId, GameError> {
+    /// Resolves any pawn's owning player — named generically since it's
+    /// used both for a deliberate audit's auditee and (below) an automatic
+    /// audit's attacker/defender, not just auditees specifically.
+    fn resolve_pawn_owner(&self, target_pawn: PawnId) -> Result<PlayerId, GameError> {
         let pawn = self
             .pawns
             .iter()
@@ -224,6 +229,56 @@ impl GameState {
                 source: overflow_source,
             });
         }
+    }
+
+    /// Routes the cards from a caught automatic-audit lie (e.g. an exposed
+    /// bluffed Shield) to wherever `RuleConfig::automatic_audit_reward_
+    /// destination` specifies — the piece that was previously missing
+    /// entirely: the mechanical revert (position, reinstated captures)
+    /// always applied via `pawn::revert`'s side effects, but the cards it
+    /// freed up had nowhere to go and were simply lost. Unlike a deliberate
+    /// audit, there's no `cascade_lie_rewards_destination`-style split
+    /// here — nobody chose to gamble, so the directly-reverted and
+    /// swept-up cards are treated as one undifferentiated pool.
+    fn route_automatic_audit_catch(
+        &mut self,
+        catch: AutomaticAuditCatch,
+        events: &mut Vec<GameEvent>,
+    ) -> Result<(), GameError> {
+        let mut cards = catch.reversion.directly_reverted_cards;
+        cards.extend(catch.reversion.swept_up_cards);
+        if cards.is_empty() {
+            return Ok(());
+        }
+        match self.rules.automatic_audit_reward_destination {
+            AutomaticAuditCardDestination::SharedPile => {
+                for &card in &cards {
+                    self.shared_pile.add(card);
+                }
+                events.push(GameEvent::CardsEnteredPile {
+                    cards,
+                    source: PileSource::AutomaticAuditSpoils,
+                });
+            }
+            AutomaticAuditCardDestination::Attacker => {
+                let attacker_owner = self.resolve_pawn_owner(catch.attacker)?;
+                let defender_owner = self.resolve_pawn_owner(catch.defender)?;
+                for &card in &cards {
+                    self.give_card_to_player(
+                        attacker_owner,
+                        card,
+                        PileSource::AutomaticAuditSpoils,
+                        events,
+                    );
+                }
+                events.push(GameEvent::CardsTransferred {
+                    from: defender_owner,
+                    to: attacker_owner,
+                    cards,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Returns `card` straight to `player`'s reserve (never their hand) —
@@ -479,7 +534,7 @@ impl GameState {
             player: acting_player,
         }];
 
-        let (captures_caused, ctx_events) = {
+        let (captures_caused, outcome) = {
             let mut proposal = MovementProposal::default();
             let mut ctx = PlayContext::new(
                 &self.topology,
@@ -502,9 +557,13 @@ impl GameState {
                 }
             }
             let captures = ctx.resolve_movement(proposal)?;
-            (captures, ctx.into_events())
+            (captures, ctx.into_outcome())
         };
-        events.extend(ctx_events);
+        events.extend(outcome.events);
+
+        for catch in outcome.automatic_audit_catches {
+            self.route_automatic_audit_catch(catch, &mut events)?;
+        }
 
         let position_after = self.pawns[pawn_index].position;
 
@@ -606,7 +665,7 @@ impl GameState {
             });
         }
 
-        let auditee = self.resolve_auditee(request.target_pawn)?;
+        let auditee = self.resolve_pawn_owner(request.target_pawn)?;
         let mut events = Vec::new();
 
         if self.rules.audit_attempt_cost > 0 {
@@ -1392,6 +1451,145 @@ mod tests {
             state.topology.yard_spaces(PlayerColor(1))[0]
         );
         assert_eq!(state.players[0].hand.len(), 2);
+    }
+
+    #[test]
+    fn bluffed_shield_caught_by_a_capture_sends_its_cards_to_the_pile_when_configured() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let bluffer_at = steps_from(&topology, PlayerColor(0), entry0, 2);
+        let attacker_at = steps_from(&topology, PlayerColor(0), entry0, 1);
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(0)]),
+        ];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), bluffer_at),
+            bare_pawn(PawnId(1), PlayerColor(1), attacker_at),
+        ];
+        let rules = RuleConfig {
+            automatic_audit_reward_destination: AutomaticAuditCardDestination::SharedPile,
+            // Isolate this test from the unrelated capture-reward mechanic,
+            // which would otherwise also draw from the pile this same
+            // turn and make the final pile contents harder to reason about.
+            capture_reward_from_pile: 0,
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        // Pawn 0 claims Shield (id 6) but actually plays Take 1 (id 0) — a
+        // lie. Shield's `on_claimed` contributes no steps, so pawn 0 stays
+        // put; only the claim (not a real Shield) gets attached.
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(6)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+        assert_eq!(state.pawns[0].position, bluffer_at);
+
+        // Pawn 1 lands exactly on pawn 0, attempting a capture. The claimed
+        // Shield gets automatically tested, found false, and pawn 0's
+        // bluffing move reverts — its actual card (id 0) has to go
+        // somewhere rather than vanish.
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(1),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::CardsEnteredPile { cards, source: PileSource::AutomaticAuditSpoils }
+                if cards == &vec![CardKindId(0)]
+        )));
+        assert_eq!(
+            state.shared_pile.take(10, &mut rand::rng()),
+            vec![CardKindId(0)]
+        );
+        assert_eq!(state.pawns[0].auditable_moves().count(), 0);
+        // The claim was false, so the "shield" never actually blocked
+        // anything — pawn 0 also gets captured in the ordinary way.
+        assert_eq!(
+            state.pawns[0].position,
+            state.topology.yard_spaces(PlayerColor(0))[0]
+        );
+    }
+
+    #[test]
+    fn bluffed_shield_caught_by_a_capture_rewards_the_attacker_when_configured() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let bluffer_at = steps_from(&topology, PlayerColor(0), entry0, 2);
+        let attacker_at = steps_from(&topology, PlayerColor(0), entry0, 1);
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]),
+            player(1, 1, vec![CardKindId(0)]),
+        ];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), bluffer_at),
+            bare_pawn(PawnId(1), PlayerColor(1), attacker_at),
+        ];
+        let rules = RuleConfig {
+            automatic_audit_reward_destination: AutomaticAuditCardDestination::Attacker,
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(6)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(1),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::CardsTransferred { from: PlayerId(0), to: PlayerId(1), cards }
+                if cards == &vec![CardKindId(0)]
+        )));
+        assert!(state.shared_pile.is_empty());
+        // Player 1 played their only hand card to capture, ending their
+        // turn empty-handed, then received the bluffer's real card, then
+        // (still within the same turn) drew back up to hand_soft_cap from
+        // their own empty deck — so the routed card is what remains.
+        assert_eq!(state.players[1].hand, vec![CardKindId(0)]);
     }
 
     #[test]

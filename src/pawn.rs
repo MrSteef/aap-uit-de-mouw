@@ -227,6 +227,20 @@ impl Pawn {
     }
 }
 
+/// The result of an automatic audit (triggered by a capture attempt, not a
+/// deliberate challenge) catching a lie: who gets credited with triggering
+/// it, whose lie it was, and what the mechanical revert produced. Recorded
+/// rather than acted on immediately — routing the cards to a player or the
+/// shared pile touches the wider game economy (caps, other players'
+/// hands), which is `GameState`'s job (ARCHITECTURE.md §16 step 8), not
+/// something a card's own hook can reach.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AutomaticAuditCatch {
+    pub attacker: PawnId,
+    pub defender: PawnId,
+    pub reversion: Reversion,
+}
+
 /// The mechanical result of reverting a pawn to just before one of its
 /// moves: what cards come loose, and which captures (if any) get
 /// reinstated.

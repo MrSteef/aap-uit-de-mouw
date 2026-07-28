@@ -570,14 +570,22 @@ several deviations from what's shown above:
 - `InteractionContext` gains `topology`, `rules`, and `pawns` fields (all
   types `context` already depends on elsewhere, so no new dependency-graph
   edge) so `trigger_automatic_audit` can actually perform a revert — see
-  its own implementation-status note below.
+  its own implementation-status note below. It also gains a `catches: &'a
+  mut Vec<AutomaticAuditCatch>` field (`AutomaticAuditCatch` lives in
+  `pawn.rs`, alongside `Reversion`) — see the fix below.
 - `AuditContext` gains a `new(...)` constructor, for the same private-field
   reason as `PlayContext`.
+- `PlayContext` carries its own `automatic_audit_catches: Vec<
+  AutomaticAuditCatch>` accumulator (borrowed by each `InteractionContext`
+  it builds inside `attempt_capture`), and `into_events(self) -> Vec<
+  GameEvent>` is `into_outcome(self) -> PlayOutcome` instead, where
+  `PlayOutcome { events: Vec<GameEvent>, automatic_audit_catches: Vec<
+  AutomaticAuditCatch> }` — see the fix below for why.
 
 `trigger_automatic_audit`'s revert mechanics are shared with
 `audit::resolve` (§9) via `pawn::revert` — see §8's implementation-status
-note for why that lives in `pawn.rs` rather than `audit.rs`. Two
-simplifications, both flagged in code comments:
+note for why that lives in `pawn.rs` rather than `audit.rs`. One
+simplification, flagged in code comments:
 - It tests the defender's *newest* auditable move, not necessarily the
   specific move that attached the effect being tested —
   `PersistentEffectState`/`ClaimedEffectState` don't record which history
@@ -585,15 +593,30 @@ simplifications, both flagged in code comments:
   age out) is a bigger structural change than this step's scope. In
   practice a capture attempt follows shortly after the relevant claim/play,
   so the newest move is almost always the right one.
-- It clears *all* of the defender's claimed effects once tested (matching
-  `claimed_effects`'s own doc comment: "resolved... the moment
-  `trigger_automatic_audit` tests them, one way or another"), not just the
-  one actually responsible, for the same reason.
 
-Also out of scope, matching `audit::resolve`'s own scoping (§9): routing
-any collected cards to the shared pile
-(`RuleConfig::automatic_audit_reward_destination`) — that's `GameState`'s
-job (§16 step 8).
+It also clears *all* of the defender's claimed effects once tested
+(matching `claimed_effects`'s own doc comment: "resolved... the moment
+`trigger_automatic_audit` tests them, one way or another"), not just the
+one actually responsible — a second, smaller simplification for the same
+underlying reason as the one above.
+
+**Fixed since this section was first written:** routing a caught
+automatic-audit lie's cards was documented above as "out of scope, that's
+`GameState`'s job" — but `GameState` never actually did that job, and
+`trigger_automatic_audit` was discarding `pawn::revert`'s returned
+`Reversion` outright. The position/reinstated-captures side of the revert
+always applied correctly (those are side effects of `pawn::revert` itself,
+not dependent on the caller using its return value), but the cards it
+freed up had no path back to `game.rs` at all — `CaptureOutcome` (what the
+capture-attempt hooks return) has no room to carry card data. Fixed by
+having `InteractionContext` record an `AutomaticAuditCatch { attacker,
+defender, reversion }` per catch instead of discarding it, threading that
+accumulator through `PlayContext` (via the `into_outcome`/`PlayOutcome`
+change above) up to `GameState`, which now routes each catch per
+`RuleConfig::automatic_audit_reward_destination` — see §13's own
+implementation-status note for the routing itself. New end-to-end tests
+in `game.rs` cover both destinations through the full `apply()` pipeline,
+not just the mechanical revert in isolation.
 
 ---
 
@@ -1503,6 +1526,19 @@ pub enum PileSource { AgedOutOverflow, CapturedPawnFinished, CascadedAuditSpoils
   no variant describing "a pawn was reinstated," and adding one felt like
   scope creep against the size this step already reached. The state
   change itself is correct; only the event log doesn't narrate it.
+
+**Fixed since this section was first written:** `GameState` now actually
+does the automatic-audit card routing described (and deferred) in §4 and
+§9's original notes. `apply_play_card` drains `PlayContext::into_outcome`'s
+`automatic_audit_catches` and routes each through a new
+`route_automatic_audit_catch`, per `RuleConfig::
+automatic_audit_reward_destination`: to the shared pile
+(`PileSource::AutomaticAuditSpoils`), or to the attacker via the same
+`give_card_to_player` cap-respecting chain everything else uses, paired
+with a `CardsTransferred` event. The private `resolve_auditee` helper is
+renamed `resolve_pawn_owner` — it now resolves an automatic audit's
+attacker and defender too, not just a deliberate audit's auditee, so the
+old name undersold what it does.
 
 ---
 
