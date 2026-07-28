@@ -19,6 +19,15 @@ pub enum GameEvent {
         pawn: PawnId,
         by: PawnId,
     },
+    /// A pawn a caught lie's revert returned to the board — reinstated
+    /// because it was captured during one of the now-undone moves, and
+    /// (per `RuleConfig::revert_captures_on_lie`) hasn't moved under its
+    /// own power since. Distinct from `PawnMoved`: this is a side effect
+    /// of someone else's lie being caught, not a move this pawn made.
+    PawnReinstated {
+        pawn: PawnId,
+        to: SpaceId,
+    },
     CardConsumed {
         player: PlayerId,
     },

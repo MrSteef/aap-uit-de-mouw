@@ -354,6 +354,9 @@ impl GameState {
         catch: AutomaticAuditCatch,
         events: &mut Vec<GameEvent>,
     ) -> Result<(), GameError> {
+        for &(pawn, to) in &catch.reversion.reinstated_captures {
+            events.push(GameEvent::PawnReinstated { pawn, to });
+        }
         let mut cards = catch.reversion.directly_reverted_cards;
         cards.extend(catch.reversion.swept_up_cards);
         if cards.is_empty() {
@@ -933,10 +936,9 @@ impl GameState {
                 }
             }
             AuditConsequence::LieCaught(revert) => {
-                // Reinstated captures' position changes are already applied
-                // by audit::resolve; no dedicated event exists to describe
-                // them (GameEvent has no "reinstated" variant), so they're
-                // not separately logged here — a known gap, not a state bug.
+                for &(pawn, to) in &revert.reinstated_captures {
+                    events.push(GameEvent::PawnReinstated { pawn, to });
+                }
                 if !revert.directly_audited_cards.is_empty() {
                     for &card in &revert.directly_audited_cards {
                         self.give_card_to_player(
@@ -1467,6 +1469,132 @@ mod tests {
         let mut hand = state.players[1].hand.clone();
         hand.sort_by_key(|c| c.0);
         assert_eq!(hand, vec![CardKindId(0), CardKindId(6)]);
+    }
+
+    #[test]
+    fn auditing_a_caught_lie_that_captured_a_pawn_reinstates_it_and_logs_it() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let victim_at = steps_from(&topology, PlayerColor(0), entry0, 2);
+        let players = vec![
+            player(0, 0, vec![CardKindId(0)]), // actually plays Take 1
+            player(1, 1, vec![CardKindId(0)]), // needs a card to afford auditing
+        ];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), entry0),
+            bare_pawn(PawnId(1), PlayerColor(1), victim_at),
+        ];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(), // revert_captures_on_lie: true
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        // Claims Take 2 (landing on and capturing pawn 1), actually plays
+        // Take 1 -- a lie in identity, matching claimed/actual counts.
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(1)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+        assert_eq!(
+            state.pawns[1].position,
+            state.topology.yard_spaces(PlayerColor(1))[0],
+            "the claimed Take 2 lands on and captures pawn 1"
+        );
+
+        let events = state
+            .apply(TurnAction::Audit(AuditRequest {
+                auditor: PlayerId(1),
+                target_pawn: PawnId(0),
+                target_move_index: 0,
+                attempt_cost_cards: Vec::new(),
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::PawnReinstated { pawn: PawnId(1), to } if *to == victim_at
+        )));
+        assert_eq!(
+            state.pawns[1].position, victim_at,
+            "the position change itself already worked before this fix -- \
+             only the event was missing"
+        );
+    }
+
+    #[test]
+    fn automatic_audit_reinstates_a_pawn_captured_during_the_reverted_move() {
+        let topology = board();
+        let entry0 = entry_of(&topology, PlayerColor(0));
+        let victim_at = steps_from(&topology, PlayerColor(0), entry0, 2);
+        let attacker_at = steps_from(&topology, PlayerColor(0), entry0, 1);
+        let players = vec![
+            player(0, 0, vec![CardKindId(6)]), // actually plays Shield
+            player(1, 1, vec![CardKindId(0)]), // attacker's Take 1
+        ];
+        let pawns = vec![
+            bare_pawn(PawnId(0), PlayerColor(0), entry0), // A, the bluffer
+            bare_pawn(PawnId(1), PlayerColor(1), victim_at), // C, captured by A's claim
+            bare_pawn(PawnId(2), PlayerColor(1), attacker_at), // B, the attacker
+        ];
+        let mut state = GameState::new(
+            topology,
+            minimal_rules(),
+            CardCatalog::standard(),
+            players,
+            pawns,
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        // A claims Take 2 (landing on and capturing C), but actually plays
+        // Shield -- a lie about identity, with a real persistent Shield
+        // attached as a side effect of what was truly played.
+        state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(1)],
+                },
+                actual_cards: vec![CardKindId(6)],
+            }))
+            .unwrap();
+        assert_eq!(state.pawns[0].position, victim_at);
+        assert_eq!(
+            state.pawns[1].position,
+            state.topology.yard_spaces(PlayerColor(1))[0],
+            "C gets captured by A's claimed move"
+        );
+
+        // B attempts to capture A. The real Shield is tested automatically
+        // (it's A's own move being challenged, not B's claim), found not to
+        // match what A claimed, and A's move reverts -- which should also
+        // reinstate C. Whether B's own capture attempt succeeds or is
+        // blocked by the (real) Shield isn't this test's concern.
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(2),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::PawnReinstated { pawn: PawnId(1), to } if *to == victim_at
+        )));
+        assert_eq!(state.pawns[1].position, victim_at);
     }
 
     #[test]

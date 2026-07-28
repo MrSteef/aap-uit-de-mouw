@@ -1537,11 +1537,6 @@ pub enum PileSource { AgedOutOverflow, CapturedPawnFinished, CascadedAuditSpoils
   that `actual_cards` are genuinely in hand and that counts/categories are
   within `RuleConfig`'s limits; it never checks the claim against hand
   contents, since a claim isn't supposed to be checkable that way.
-- A reinstated capture's position change (from `audit::resolve`'s
-  `RevertOutcome`) is applied but not separately logged — `GameEvent` has
-  no variant describing "a pawn was reinstated," and adding one felt like
-  scope creep against the size this step already reached. The state
-  change itself is correct; only the event log doesn't narrate it.
 
 **Fixed since this section was first written:** `GameState` now actually
 does the automatic-audit card routing described (and deferred) in §4 and
@@ -1613,6 +1608,18 @@ acknowledged gap, are now implemented.
   the initial `current_player` already can't act on turn one isn't
   special-cased. In practice this only matters for a deliberately
   degenerate starting configuration.
+
+**Also fixed since:** the missing `GameEvent` for a reinstated capture,
+flagged above as a known gap. `event.rs` gains `PawnReinstated { pawn,
+to }`, distinct from `PawnMoved` — this is a side effect of someone
+else's lie being caught, not a move the pawn itself made. Both places
+that already computed reinstatement correctly (they always had — this was
+purely a missing log entry, not a state bug) now emit it per pawn in
+`RevertOutcome`/`AutomaticAuditCatch`'s `reinstated_captures`: the
+deliberate-audit `LieCaught` handling, and `route_automatic_audit_catch`.
+New tests cover both paths end to end — a caught lie that captured a
+pawn along the way reinstates it and logs it, for both a deliberate audit
+and a bluffed-Shield-exposed-by-a-capture-attempt automatic one.
 
 ---
 
