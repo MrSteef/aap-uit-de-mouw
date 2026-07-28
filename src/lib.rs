@@ -1,9 +1,12 @@
+pub mod agent;
 pub mod audit;
 pub mod board;
 pub mod card;
 pub mod context;
 pub mod deck;
+pub mod driver;
 pub mod event;
+pub mod game;
 pub mod movement;
 pub mod pawn;
 pub mod play;

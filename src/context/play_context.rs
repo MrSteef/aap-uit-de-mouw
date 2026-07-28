@@ -294,6 +294,14 @@ impl<'a> PlayContext<'a> {
     pub fn emit(&mut self, event: GameEvent) {
         self.events.push(event);
     }
+
+    /// Consumes this context, returning every event it accumulated —
+    /// `PlayContext` doesn't have a way to hand game state its log
+    /// incrementally, so the caller drains it once the play is fully
+    /// resolved.
+    pub fn into_events(self) -> Vec<GameEvent> {
+        self.events
+    }
 }
 
 #[cfg(test)]
