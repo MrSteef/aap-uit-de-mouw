@@ -180,6 +180,7 @@ mod tests {
         let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
         pawn.attach_persistent_effect(PersistentEffectState {
             source_card: CardId(9),
+            source_move: 0,
             anchor: EffectAnchor::Pawn(PawnId(0)),
             revealed: false,
             expires: Some(ExpiryCondition::OnPawnMoved),
@@ -197,12 +198,14 @@ mod tests {
         let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
         pawn.attach_persistent_effect(PersistentEffectState {
             source_card: CardId(9),
+            source_move: 0,
             anchor: EffectAnchor::Pawn(PawnId(0)),
             revealed: false,
             expires: None,
         });
         pawn.attach_persistent_effect(PersistentEffectState {
             source_card: CardId(10),
+            source_move: 0,
             anchor: EffectAnchor::Pawn(PawnId(0)),
             revealed: true,
             expires: None,
@@ -223,6 +226,7 @@ mod tests {
         let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(1));
         pawn.push_move(
             crate::pawn::MoveRecord {
+                sequence: 0, // overwritten by push_move
                 claimed_cards: vec![CardId(1)],
                 actual_cards: vec![CardId(2)],
                 position_before: SpaceId(0),
@@ -246,6 +250,7 @@ mod tests {
         let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(2));
         pawn.push_move(
             crate::pawn::MoveRecord {
+                sequence: 0, // overwritten by push_move
                 claimed_cards: vec![CardId(1)],
                 actual_cards: vec![CardId(2)],
                 position_before: SpaceId(0),
@@ -257,6 +262,7 @@ mod tests {
         );
         pawn.push_move(
             crate::pawn::MoveRecord {
+                sequence: 0, // overwritten by push_move
                 claimed_cards: vec![CardId(3)],
                 actual_cards: vec![CardId(3)],
                 position_before: SpaceId(1),

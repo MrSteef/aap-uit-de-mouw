@@ -108,6 +108,18 @@ impl<'a> PlayContext<'a> {
         self.mover
     }
 
+    /// `mover`'s next move sequence — what `push_move` will stamp onto the
+    /// `MoveRecord` this play eventually creates, once it's actually
+    /// pushed (which hasn't happened yet at the point an effect gets
+    /// attached). Used to tag effects with the move that created them.
+    fn mover_next_sequence(&self) -> u64 {
+        self.pawns
+            .iter()
+            .find(|pawn| pawn.id == self.mover)
+            .map(Pawn::next_sequence)
+            .expect("PlayContext::mover must be one of PlayContext::pawns")
+    }
+
     /// Declares which card is about to have its `on_played`/`on_claimed`
     /// dispatched — must be called before each such dispatch, since
     /// `attach_persistent_effect`/`attach_claimed_effect` attribute the
@@ -219,23 +231,27 @@ impl<'a> PlayContext<'a> {
                 &mut self.automatic_audit_catches,
             );
             for effect in &persistent {
-                if let Some(meta) = self.catalog.get(effect.source_card)
-                    && meta
+                if let Some(meta) = self.catalog.get(effect.source_card) {
+                    interaction_ctx.begin_effect(effect.source_move);
+                    if meta
                         .behavior
                         .on_capture_attempted_as_played(&mut interaction_ctx)
                         == CaptureOutcome::Blocked
-                {
-                    blocked = true;
+                    {
+                        blocked = true;
+                    }
                 }
             }
             for effect in &claimed {
-                if let Some(meta) = self.catalog.get(effect.source_card)
-                    && meta
+                if let Some(meta) = self.catalog.get(effect.source_card) {
+                    interaction_ctx.begin_effect(effect.source_move);
+                    if meta
                         .behavior
                         .on_capture_attempted_as_claimed(&mut interaction_ctx)
                         == CaptureOutcome::Blocked
-                {
-                    blocked = true;
+                    {
+                        blocked = true;
+                    }
                 }
             }
         }
@@ -258,7 +274,10 @@ impl<'a> PlayContext<'a> {
     }
 
     /// Attaches a real persistent effect, anchored to `anchor`, for
-    /// whichever card `begin_card` most recently declared.
+    /// whichever card `begin_card` most recently declared. Tagged with
+    /// `mover`'s next move sequence, so an automatic audit can later find
+    /// the specific move that created it (see
+    /// `pawn::PersistentEffectState::source_move`).
     pub fn attach_persistent_effect(
         &mut self,
         anchor: EffectAnchor,
@@ -267,8 +286,10 @@ impl<'a> PlayContext<'a> {
         let source_card = self.current_card.expect(
             "attach_persistent_effect called without begin_card — see PlayContext::begin_card",
         );
+        let source_move = self.mover_next_sequence();
         let effect = PersistentEffectState {
             source_card,
+            source_move,
             anchor,
             revealed: false,
             expires,
@@ -290,16 +311,19 @@ impl<'a> PlayContext<'a> {
     /// `EffectAnchor::Pawn` is meaningful here — `ClaimedEffectState` lives
     /// on `Pawn` (ARCHITECTURE.md §8), with no space-anchored equivalent;
     /// a `Space`-anchored claim is silently dropped, since no card claims
-    /// one yet.
+    /// one yet. Tagged with `mover`'s next move sequence, same as
+    /// `attach_persistent_effect`.
     pub fn attach_claimed_effect(&mut self, anchor: EffectAnchor) {
         let source_card = self.current_card.expect(
             "attach_claimed_effect called without begin_card — see PlayContext::begin_card",
         );
+        let source_move = self.mover_next_sequence();
         if let EffectAnchor::Pawn(id) = anchor
             && let Some(pawn) = self.pawns.iter_mut().find(|pawn| pawn.id == id)
         {
             pawn.attach_claimed_effect(ClaimedEffectState {
                 source_card,
+                source_move,
                 anchor,
             });
         }

@@ -226,6 +226,7 @@ mod tests {
 
     fn record(claimed: Vec<u16>, actual: Vec<u16>, before: u32, after: u32) -> MoveRecord {
         MoveRecord {
+            sequence: 0, // overwritten by push_move
             claimed_cards: claimed.into_iter().map(CardKindId).collect(),
             actual_cards: actual.into_iter().map(CardKindId).collect(),
             position_before: SpaceId(before),

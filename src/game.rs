@@ -581,6 +581,7 @@ impl GameState {
         }
 
         let record = MoveRecord {
+            sequence: 0, // overwritten by push_move, right below
             claimed_cards: claimed,
             actual_cards: actual,
             position_before,
@@ -1603,6 +1604,7 @@ mod tests {
         // this pawn crosses into Finish.
         pawn.push_move(
             MoveRecord {
+                sequence: 0, // overwritten by push_move
                 claimed_cards: vec![CardKindId(7)],
                 actual_cards: vec![CardKindId(7)],
                 position_before: last_lane_space,
@@ -1654,6 +1656,7 @@ mod tests {
         let mut pawn = bare_pawn(PawnId(0), color0, last_lane_space);
         pawn.push_move(
             MoveRecord {
+                sequence: 0, // overwritten by push_move
                 claimed_cards: vec![CardKindId(7)],
                 actual_cards: vec![CardKindId(7)],
                 position_before: last_lane_space,
@@ -1729,6 +1732,7 @@ mod tests {
         );
         state.pawns[1].push_move(
             MoveRecord {
+                sequence: 0, // overwritten by push_move
                 claimed_cards: vec![CardKindId(1)],
                 actual_cards: vec![CardKindId(1)],
                 position_before: entry1,

@@ -165,6 +165,7 @@ mod tests {
         let mut pawns = vec![bare_pawn(PawnId(0), PlayerColor(0), entry0)];
         pawns[0].push_move(
             crate::pawn::MoveRecord {
+                sequence: 0, // overwritten by push_move
                 claimed_cards: vec![CardKindId(0)],
                 actual_cards: vec![CardKindId(0)],
                 position_before: entry0,

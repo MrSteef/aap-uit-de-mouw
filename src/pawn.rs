@@ -30,12 +30,17 @@ pub struct Pawn {
     persistent_effects: Vec<PersistentEffectState>,
     /// Outstanding *claims* of a persistent effect, tracked separately from
     /// real ones — see the anchor-mismatch note in ARCHITECTURE.md §5.
-    /// Resolved (removed) the moment `trigger_automatic_audit` tests them,
-    /// one way or another.
+    /// Resolved (removed) the moment `trigger_automatic_audit` tests the
+    /// specific one it's about, one way or another.
     claimed_effects: Vec<ClaimedEffectState>,
     /// Capacity is bounded to `RuleConfig::audit_window` by whoever calls
     /// `push_move`, not enforced internally by this type.
     history: VecDeque<MoveRecord>,
+    /// Stamped onto each `MoveRecord` as it's pushed, then never reused —
+    /// unlike a `history` index, which shifts as older records age out,
+    /// this stays a stable way to name "the move that attached effect X"
+    /// for as long as that move remains in the window. See `next_sequence`.
+    next_move_sequence: u64,
 }
 
 /// Anchors a persistent effect to a pawn (follows it wherever it goes) or a
@@ -55,6 +60,11 @@ pub enum EffectAnchor {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PersistentEffectState {
     pub source_card: CardKindId,
+    /// Which of the *acting* pawn's moves attached this effect — see
+    /// `Pawn::next_sequence`. Lets an automatic audit test the move that
+    /// actually created the effect being challenged, rather than whatever
+    /// the pawn's most recent move happens to be.
+    pub source_move: u64,
     pub anchor: EffectAnchor,
     pub revealed: bool,
     pub expires: Option<ExpiryCondition>,
@@ -73,6 +83,9 @@ pub enum ExpiryCondition {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ClaimedEffectState {
     pub source_card: CardKindId,
+    /// See `PersistentEffectState::source_move` — the same idea, for the
+    /// claim rather than the real attachment.
+    pub source_move: u64,
     pub anchor: EffectAnchor,
 }
 
@@ -80,6 +93,10 @@ pub struct ClaimedEffectState {
 /// did.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct MoveRecord {
+    /// Stamped by `Pawn::push_move`, which owns the counter this comes
+    /// from — any value set here by the caller is overwritten, so
+    /// constructing a `MoveRecord` can use a placeholder.
+    pub sequence: u64,
     pub claimed_cards: Vec<CardKindId>,
     pub actual_cards: Vec<CardKindId>,
     pub position_before: SpaceId,
@@ -115,11 +132,23 @@ impl MoveRecord {
 }
 
 impl Pawn {
-    /// Pushes `record` onto this pawn's history. If that leaves more than
-    /// `window` records, the oldest one ages out and is returned — its
-    /// cards are the caller's responsibility to route back to the owner's
-    /// reserve (ARCHITECTURE.md §10). `None` if nothing aged out.
-    pub fn push_move(&mut self, record: MoveRecord, window: usize) -> Option<MoveRecord> {
+    /// The sequence number the *next* call to `push_move` will stamp onto
+    /// its record — lets a card's hook (via `PlayContext`) tag an effect
+    /// it's attaching with "the move that's about to be created," before
+    /// that move actually exists yet.
+    pub fn next_sequence(&self) -> u64 {
+        self.next_move_sequence
+    }
+
+    /// Pushes `record` onto this pawn's history, stamping it with the next
+    /// sequence number first (overwriting whatever `record.sequence` was
+    /// set to). If that leaves more than `window` records, the oldest one
+    /// ages out and is returned — its cards are the caller's responsibility
+    /// to route back to the owner's reserve (ARCHITECTURE.md §10). `None`
+    /// if nothing aged out.
+    pub fn push_move(&mut self, mut record: MoveRecord, window: usize) -> Option<MoveRecord> {
+        record.sequence = self.next_move_sequence;
+        self.next_move_sequence += 1;
         self.history.push_back(record);
         if self.history.len() > window {
             self.history.pop_front()
@@ -163,14 +192,15 @@ impl Pawn {
         self.claimed_effects.push(effect);
     }
 
-    /// Resolves every outstanding claimed effect on this pawn — called once
-    /// `trigger_automatic_audit` has tested them, one way or another (see
-    /// the field doc on `claimed_effects`). Simplification: clears *all*
-    /// claimed effects rather than just the one actually tested, since
-    /// nothing here tracks which specific claim a given automatic-audit
-    /// check was about.
-    pub fn clear_claimed_effects(&mut self) {
-        self.claimed_effects.clear();
+    /// Resolves the claimed effect attached by move `source_move`, if one
+    /// is still outstanding — called once `trigger_automatic_audit` has
+    /// tested it, one way or another (see the field doc on
+    /// `claimed_effects`). A no-op if no claim from that move exists (it
+    /// may already have been resolved, or the source move aged out of the
+    /// window before ever being tested).
+    pub fn resolve_claimed_effect(&mut self, source_move: u64) {
+        self.claimed_effects
+            .retain(|effect| effect.source_move != source_move);
     }
 
     /// Clears `persistent_effects` and `claimed_effects`, moves `position`
@@ -330,11 +360,13 @@ pub(crate) mod tests {
             persistent_effects: Vec::new(),
             claimed_effects: Vec::new(),
             history: VecDeque::new(),
+            next_move_sequence: 0,
         }
     }
 
     fn record(claimed: Vec<u16>, actual: Vec<u16>, before: u32, after: u32) -> MoveRecord {
         MoveRecord {
+            sequence: 0, // overwritten by push_move
             claimed_cards: claimed.into_iter().map(CardKindId).collect(),
             actual_cards: actual.into_iter().map(CardKindId).collect(),
             position_before: SpaceId(before),
@@ -353,12 +385,25 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn push_move_stamps_a_stable_increasing_sequence() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        assert_eq!(pawn.next_sequence(), 0);
+        pawn.push_move(record(vec![1], vec![1], 0, 1), 5);
+        assert_eq!(pawn.next_sequence(), 1);
+        pawn.push_move(record(vec![2], vec![2], 1, 2), 5);
+        assert_eq!(pawn.next_sequence(), 2);
+        let sequences: Vec<u64> = pawn.auditable_moves().map(|(_, r)| r.sequence).collect();
+        assert_eq!(sequences, vec![0, 1]);
+    }
+
+    #[test]
     fn push_move_ages_out_the_oldest_record_past_the_window() {
         let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
         let first = record(vec![1], vec![1], 0, 1);
-        assert_eq!(pawn.push_move(first.clone(), 1), None);
+        assert_eq!(pawn.push_move(first, 1), None);
+        let first_as_stored = pawn.auditable_moves().next().unwrap().1.clone();
         let aged_out = pawn.push_move(record(vec![2], vec![2], 1, 2), 1);
-        assert_eq!(aged_out, Some(first));
+        assert_eq!(aged_out, Some(first_as_stored));
         assert_eq!(pawn.auditable_moves().count(), 1);
     }
 
@@ -377,12 +422,14 @@ pub(crate) mod tests {
         pawn.push_move(record(vec![1], vec![1], 0, 5), 5);
         pawn.persistent_effects.push(PersistentEffectState {
             source_card: CardKindId(9),
+            source_move: 0,
             anchor: EffectAnchor::Pawn(PawnId(0)),
             revealed: false,
             expires: None,
         });
         pawn.claimed_effects.push(ClaimedEffectState {
             source_card: CardKindId(9),
+            source_move: 0,
             anchor: EffectAnchor::Pawn(PawnId(0)),
         });
 
@@ -454,17 +501,39 @@ pub(crate) mod tests {
         let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
         pawn.attach_persistent_effect(PersistentEffectState {
             source_card: CardKindId(9),
+            source_move: 0,
             anchor: EffectAnchor::Pawn(PawnId(0)),
             revealed: false,
             expires: Some(ExpiryCondition::OnPawnMoved),
         });
         pawn.attach_claimed_effect(ClaimedEffectState {
             source_card: CardKindId(9),
+            source_move: 0,
             anchor: EffectAnchor::Pawn(PawnId(0)),
         });
 
         assert_eq!(pawn.persistent_effects().len(), 1);
         assert_eq!(pawn.claimed_effects().len(), 1);
+    }
+
+    #[test]
+    fn resolve_claimed_effect_only_removes_the_matching_source_move() {
+        let mut pawn = bare_pawn(PawnId(0), PlayerColor(0), SpaceId(0));
+        pawn.attach_claimed_effect(ClaimedEffectState {
+            source_card: CardKindId(9),
+            source_move: 0,
+            anchor: EffectAnchor::Pawn(PawnId(0)),
+        });
+        pawn.attach_claimed_effect(ClaimedEffectState {
+            source_card: CardKindId(9),
+            source_move: 1,
+            anchor: EffectAnchor::Pawn(PawnId(0)),
+        });
+
+        pawn.resolve_claimed_effect(0);
+
+        assert_eq!(pawn.claimed_effects().len(), 1);
+        assert_eq!(pawn.claimed_effects()[0].source_move, 1);
     }
 
     #[test]

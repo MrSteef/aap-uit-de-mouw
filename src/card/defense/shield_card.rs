@@ -68,6 +68,7 @@ mod tests {
 
     fn record(claimed: Vec<u16>, actual: Vec<u16>, before: u32, after: u32) -> MoveRecord {
         MoveRecord {
+            sequence: 0, // overwritten by push_move
             claimed_cards: claimed.into_iter().map(CardKindId).collect(),
             actual_cards: actual.into_iter().map(CardKindId).collect(),
             position_before: SpaceId(before),
@@ -250,6 +251,77 @@ mod tests {
             pawns[0].position,
             topology.yard_spaces(PlayerColor(0))[0],
             "capture proceeded, sending it to yard"
+        );
+    }
+
+    /// Regression test for the "tests the newest move" bug: before linking
+    /// an effect to the specific move that created it, a bluffed Shield
+    /// claim could be "laundered" by playing one more truthful move with
+    /// the same pawn before anyone attacked — the automatic audit would
+    /// test that newer, honest move instead and find nothing wrong.
+    #[test]
+    fn bluffed_shield_is_still_caught_after_a_later_truthful_move() {
+        let shield_id = CardKindId(0);
+        let real_card_id = CardKindId(1);
+        let topology = crate::board::BoardTopology::standard_ring(2, 8, 3, 2).unwrap();
+        let rules = minimal_rules();
+        let catalog = catalog_with_shield(shield_id);
+        let defender = PawnId(0);
+        let attacker = PawnId(1);
+        let mut pawns = vec![
+            bare_pawn(defender, PlayerColor(0), SpaceId(6)),
+            bare_pawn(attacker, PlayerColor(1), SpaceId(5)),
+        ];
+        let mut space_effects = HashMap::new();
+
+        // Move 0: claims Shield, actually plays something else — a lie,
+        // and (since Shield's on_claimed contributes no steps) the pawn
+        // doesn't move.
+        {
+            let mut ctx = PlayContext::new(
+                &topology,
+                &rules,
+                &catalog,
+                &mut pawns,
+                &mut space_effects,
+                defender,
+            );
+            ctx.begin_card(shield_id);
+            let mut proposal = MovementProposal::default();
+            ShieldCard {
+                duration: ExpiryCondition::OnPawnMoved,
+            }
+            .on_claimed(&mut ctx, &mut proposal);
+        }
+        pawns[0].push_move(record(vec![shield_id.0], vec![real_card_id.0], 6, 6), 5);
+
+        // Move 1: an unrelated, entirely truthful move with the same pawn.
+        pawns[0].push_move(record(vec![2], vec![2], 6, 7), 5);
+
+        // Now the attacker attempts a capture. The claimed Shield is still
+        // outstanding from move 0 — the automatic audit must test *that*
+        // move, not move 1 (the newest), to catch the bluff.
+        let outcome = {
+            let mut ctx = PlayContext::new(
+                &topology,
+                &rules,
+                &catalog,
+                &mut pawns,
+                &mut space_effects,
+                attacker,
+            );
+            ctx.attempt_capture(defender, true)
+        };
+
+        assert_eq!(outcome, CaptureOutcome::Proceeds);
+        assert!(pawns[0].claimed_effects().is_empty());
+        // Both moves get swept away by reverting move 0 (the bluff),
+        // leaving the pawn back at its pre-bluff position, then captured.
+        assert_eq!(pawns[0].auditable_moves().count(), 0);
+        assert_eq!(
+            pawns[0].position,
+            topology.yard_spaces(PlayerColor(0))[0],
+            "the exposed bluff reverts both moves, then the real capture proceeds"
         );
     }
 }
