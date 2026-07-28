@@ -17,7 +17,10 @@ use crate::movement::MoveError;
 use crate::pawn::{MoveRecord, Pawn, PawnId, PersistentEffectState, RevealScope};
 use crate::play::{Declaration, PlayedCard};
 use crate::player::{Player, PlayerId};
-use crate::rules::{CardDestination, ExitRule, PaymentSelectionMode, RuleConfig};
+use crate::rules::{
+    CardDestination, CascadeSweepDestination, ExitRule, FinishedPawnHistoryDestination,
+    PaymentSelectionMode, RuleConfig,
+};
 use crate::view::{self, GameView};
 
 /// One action a player may submit on their turn.
@@ -540,18 +543,35 @@ impl GameState {
             }
         }
 
-        if self.rules.finished_pawn_dumps_history_destination
-            && self.topology.node(position_after)?.kind == SpaceKind::Finish
-        {
+        if self.topology.node(position_after)?.kind == SpaceKind::Finish {
+            // A finished pawn never moves again, so its history can never
+            // naturally age out via `push_move`'s own eviction — it has to
+            // be drained here, regardless of which destination the rule
+            // below sends it to, or the cards would simply never resolve.
             let dumped = self.pawns[pawn_index].collect_early_forfeiting_reinstatement();
             if !dumped.is_empty() {
-                for &card in &dumped {
-                    self.shared_pile.add(card);
+                match self.rules.finished_pawn_dumps_history_destination {
+                    FinishedPawnHistoryDestination::SharedPile => {
+                        for &card in &dumped {
+                            self.shared_pile.add(card);
+                        }
+                        events.push(GameEvent::CardsEnteredPile {
+                            cards: dumped,
+                            source: PileSource::CapturedPawnFinished,
+                        });
+                    }
+                    FinishedPawnHistoryDestination::OwnerReserve => {
+                        for card in dumped {
+                            self.return_card_to_reserve(
+                                acting_player,
+                                card,
+                                self.rules.aged_out_exempt_from_deck_cap,
+                                PileSource::AgedOutOverflow,
+                                &mut events,
+                            );
+                        }
+                    }
                 }
-                events.push(GameEvent::CardsEnteredPile {
-                    cards: dumped,
-                    source: PileSource::CapturedPawnFinished,
-                });
             }
         }
 
@@ -678,7 +698,9 @@ impl GameState {
                     });
                 }
                 if !revert.swept_up_cards.is_empty() {
-                    if self.rules.cascade_lie_rewards_destination {
+                    if self.rules.cascade_lie_rewards_destination
+                        == CascadeSweepDestination::SharedPile
+                    {
                         for &card in &revert.swept_up_cards {
                             self.shared_pile.add(card);
                         }
@@ -1009,6 +1031,20 @@ mod tests {
             };
         }
         here
+    }
+
+    /// The home-lane space immediately before Finish, for `board()`'s
+    /// 8-ring/3-lane layout: 7 ring steps from entry reaches the fork, then
+    /// the non-ring branch option enters the 3-space lane, then 2 more
+    /// steps reaches its last space.
+    fn last_home_lane_space(topology: &BoardTopology, color: PlayerColor) -> SpaceId {
+        let entry = entry_of(topology, color);
+        let fork = steps_from(topology, color, entry, 7);
+        let lane_entry = match topology.next_space(fork, color).unwrap() {
+            NextSpace::Branch(options) => *options.iter().find(|&&s| s != entry).unwrap(),
+            other => panic!("expected a branch at the home-lane fork, got {other:?}"),
+        };
+        steps_from(topology, color, lane_entry, 2)
     }
 
     #[test]
@@ -1356,6 +1392,119 @@ mod tests {
             state.topology.yard_spaces(PlayerColor(1))[0]
         );
         assert_eq!(state.players[0].hand.len(), 2);
+    }
+
+    #[test]
+    fn finished_pawn_dumps_history_to_the_pile_when_configured() {
+        let topology = board();
+        let color0 = PlayerColor(0);
+        let last_lane_space = last_home_lane_space(&topology, color0);
+        let players = vec![player(0, 0, vec![CardKindId(0)]), player(1, 1, Vec::new())];
+        let mut pawn = bare_pawn(PawnId(0), color0, last_lane_space);
+        // Seed a dormant history entry so there's something to dump once
+        // this pawn crosses into Finish.
+        pawn.push_move(
+            MoveRecord {
+                claimed_cards: vec![CardKindId(7)],
+                actual_cards: vec![CardKindId(7)],
+                position_before: last_lane_space,
+                position_after: last_lane_space,
+                captures_caused: Vec::new(),
+                reveal: RevealScope::Hidden,
+            },
+            3,
+        );
+        let rules = RuleConfig {
+            finished_pawn_dumps_history_destination: FinishedPawnHistoryDestination::SharedPile,
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            vec![pawn],
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::CardsEnteredPile { cards, source: PileSource::CapturedPawnFinished }
+                if cards == &vec![CardKindId(7), CardKindId(0)]
+        )));
+        assert_eq!(state.pawns[0].auditable_moves().count(), 0);
+        assert!(state.players[0].deck.is_empty());
+    }
+
+    #[test]
+    fn finished_pawn_returns_history_to_owners_reserve_when_configured() {
+        let topology = board();
+        let color0 = PlayerColor(0);
+        let last_lane_space = last_home_lane_space(&topology, color0);
+        let players = vec![player(0, 0, vec![CardKindId(0)]), player(1, 1, Vec::new())];
+        let mut pawn = bare_pawn(PawnId(0), color0, last_lane_space);
+        pawn.push_move(
+            MoveRecord {
+                claimed_cards: vec![CardKindId(7)],
+                actual_cards: vec![CardKindId(7)],
+                position_before: last_lane_space,
+                position_after: last_lane_space,
+                captures_caused: Vec::new(),
+                reveal: RevealScope::Hidden,
+            },
+            3,
+        );
+        let rules = RuleConfig {
+            finished_pawn_dumps_history_destination: FinishedPawnHistoryDestination::OwnerReserve,
+            ..minimal_rules()
+        };
+        let mut state = GameState::new(
+            topology,
+            rules,
+            CardCatalog::standard(),
+            players,
+            vec![pawn],
+            SharedPile::new(Vec::new()),
+            PlayerId(0),
+        );
+
+        let events = state
+            .apply(TurnAction::PlayCard(PlayedCard {
+                declaration: Declaration {
+                    pawn: PawnId(0),
+                    claimed_cards: vec![CardKindId(0)],
+                },
+                actual_cards: vec![CardKindId(0)],
+            }))
+            .unwrap();
+
+        // Regression test: before the fix, `OwnerReserve` silently did
+        // nothing, and since a finished pawn never moves again to trigger
+        // history's normal aging-out eviction, the cards would have stayed
+        // attached forever — neither in the pile nor recoverable by the
+        // owner. Now they return to the reserve, and (since hand size is
+        // below `hand_soft_cap`) the same turn's end-of-turn draw pulls
+        // them straight back into hand.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, GameEvent::CardsEnteredPile { .. }))
+        );
+        assert_eq!(state.pawns[0].auditable_moves().count(), 0);
+        let mut hand = state.players[0].hand.clone();
+        hand.sort_by_key(|c| c.0);
+        assert_eq!(hand, vec![CardKindId(0), CardKindId(7)]);
     }
 
     #[test]

@@ -312,21 +312,20 @@ pub struct RuleConfig {
     pub capture_reward_from_pile: u8,
     /// A Shield-style automatic check (triggered by a capture *attempt*,
     /// not chosen by a player) still fully applies its revert if it
-    /// catches a lie — but the collected cards go to the shared pile by
-    /// default, not to the attacking player, since they staked nothing.
-    pub automatic_audit_reward_destination: bool,
+    /// catches a lie — but the collected cards go wherever this specifies
+    /// by default, not to the attacking player, since they staked nothing.
+    pub automatic_audit_reward_destination: AutomaticAuditCardDestination,
     /// When a pawn reaches Finish, whatever's still attached to its
-    /// history (hasn't yet aged out) redirects to the shared pile instead
-    /// of ever reaching the owner's reserve — a deliberate cost for
-    /// completing a pawn's journey.
-    pub finished_pawn_dumps_history_destination: bool,
-    /// On a deliberate audit that catches a lie: if true, only the
-    /// *directly audited* move's cards go to the auditor, and cards from
-    /// the newer moves swept up in the cascade go to the shared pile
-    /// instead (the audited move is always the oldest one reverted — older
-    /// moves than that are never touched at all). If false, the auditor
-    /// collects the whole chain.
-    pub cascade_lie_rewards_destination: bool,
+    /// history (hasn't yet aged out) redirects wherever this specifies —
+    /// a deliberate cost for completing a pawn's journey, if sent to the
+    /// pile rather than back to its owner's own reserve.
+    pub finished_pawn_dumps_history_destination: FinishedPawnHistoryDestination,
+    /// On a deliberate audit that catches a lie: the *directly audited*
+    /// move's cards always go to the auditor; this decides where the
+    /// cards from the newer moves merely swept up in the cascade go
+    /// instead (the audited move is always the oldest one reverted —
+    /// older moves than that are never touched at all).
+    pub cascade_lie_rewards_destination: CascadeSweepDestination,
 
     /// Checked first, independently of whether the player could otherwise
     /// still act (e.g. via a dormant collectible pawn in their yard) —
@@ -343,6 +342,20 @@ pub struct RuleConfig {
     /// legal action available. See §10.
     pub no_available_action_behavior: NoAvailableActionBehavior,
 }
+
+/// Where the cards from an automatically-caught bluff (e.g. an exposed
+/// fake Shield) go: the shared pile, or the attacking player who triggered
+/// the check by attempting a capture.
+pub enum AutomaticAuditCardDestination { SharedPile, Attacker }
+
+/// Where a finishing pawn's still-attached history cards go: the shared
+/// pile, or back to their owner's own reserve, same as a natural age-out.
+pub enum FinishedPawnHistoryDestination { SharedPile, OwnerReserve }
+
+/// Where a big caught lie's cascaded-away (merely swept-up, not directly
+/// audited) cards go: the shared pile, or along with the directly-audited
+/// move's cards to the auditor.
+pub enum CascadeSweepDestination { SharedPile, Auditor }
 
 pub enum ExitRule { Automatic, RequiresCard(CardKindId) }
 
@@ -387,6 +400,28 @@ pub enum NoAvailableActionBehavior {
 
 pub enum EliminatedPawnHandling { Frozen, Removed }
 ```
+
+**Implementation status.** All of §3 matches the above, with one fix since
+it was first written: `automatic_audit_reward_destination`,
+`finished_pawn_dumps_history_destination`, and
+`cascade_lie_rewards_destination` were originally plain `bool`s — but
+named like they held a `CardDestination`-style value (matching
+`audit_attempt_cost_destination`/`false_accusation_destination`
+immediately above them), which was misleading given they weren't actually
+typed that way. They're the three enums shown above now instead, each
+naming the specific two options that actually apply to that field (a
+generic `CardDestination` doesn't fit any of the three: the "not the pile"
+option is a different specific recipient in each case — the attacker, the
+pawn's own owner, or the auditor).
+
+Retyping `finished_pawn_dumps_history_destination` surfaced a real bug in
+its `OwnerReserve` branch: it was previously a silent no-op. Since a
+finished pawn never moves again, its history could never naturally age
+out via the usual eviction-on-new-move mechanism either — cards would
+have stayed attached forever, reachable by no one. Fixed in `game.rs` to
+actively drain and route the history to whichever destination is
+configured, in both cases, with new test coverage for both branches
+(there was none before, which is how this went unnoticed).
 
 ---
 
