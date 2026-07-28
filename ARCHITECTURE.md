@@ -1337,6 +1337,25 @@ pub fn play_one_turn(
 }
 ```
 
+**Implementation status.** All of §12 is implemented as shown (§16 step 8),
+using `.first()` instead of `.get(0)` (equivalent, just clippy's preferred
+spelling). Two bugs the fuzz test described in §15 actually caught while
+building this:
+
+- `apply`'s `PlayCard` handler was the only place that advanced
+  `current_player` — an audit-ending turn (`auditing_costs_turn`, or a
+  `StunTrapCard` forfeit) never did. Fixed in `game.rs`'s `apply_audit`:
+  it now advances the turn itself once no forfeit from that same audit is
+  still pending.
+- `legal_actions` originally offered every combinatorially-valid card
+  combo without checking whether the resulting move could actually
+  resolve — a combo landing a pawn exactly on its own home-lane fork
+  would return `MoveError::UnresolvedBranch` if submitted, since there's
+  no branch-resolution mechanism (§6). Fixed with a `combo_is_walkable`
+  check in `game.rs` that trial-runs the real `on_claimed`/
+  `resolve_movement` dispatch against a scratch clone of the pawns before
+  offering a combo as legal.
+
 ---
 
 ## 13. Orchestration — `game.rs`

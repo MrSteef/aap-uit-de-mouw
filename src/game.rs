@@ -167,6 +167,34 @@ impl GameState {
             .ok_or(GameError::Audit(AuditError::UnknownAuditee(target_pawn)))
     }
 
+    /// Whether claiming `combo` for `pawn_id` would actually resolve —
+    /// `movement::walk` can fail (e.g. landing exactly on the pawn's own
+    /// home-lane fork, which has no branch-resolution mechanism yet), and
+    /// a combo that can't resolve isn't a legal action to offer. Runs the
+    /// real `on_claimed`/`resolve_movement` dispatch against a scratch
+    /// clone of the pawns, so this stays correct for whatever cards exist
+    /// rather than hardcoding movement-card knowledge here.
+    fn combo_is_walkable(&self, pawn_id: PawnId, combo: &[CardKindId]) -> bool {
+        let mut scratch_pawns = self.pawns.clone();
+        let mut scratch_space_effects = self.space_effects.clone();
+        let mut proposal = MovementProposal::default();
+        let mut ctx = PlayContext::new(
+            &self.topology,
+            &self.rules,
+            &self.catalog,
+            &mut scratch_pawns,
+            &mut scratch_space_effects,
+            pawn_id,
+        );
+        for &card_id in combo {
+            ctx.begin_card(card_id);
+            if let Some(meta) = self.catalog.get(card_id) {
+                meta.behavior.on_claimed(&mut ctx, &mut proposal);
+            }
+        }
+        ctx.resolve_movement(proposal).is_ok()
+    }
+
     /// Adds `card` to `player`'s hand if under `hand_hard_cap`, else their
     /// reserve (checked against `deck_cap`), else the shared pile — the
     /// standard chain for any external inflow.
@@ -684,6 +712,19 @@ impl GameState {
             });
         }
 
+        // `apply` doesn't otherwise know about "turns" (driver.rs decides
+        // when one is over) — but when auditing itself ends the turn
+        // (`auditing_costs_turn`), or a `StunTrapCard` cuts it short,
+        // *something* has to actually advance `current_player`, the same
+        // way `apply_play_card` always does. Skipped while a forfeit from
+        // *this* audit is still pending — that has to clear first.
+        if (self.rules.auditing_costs_turn || resolution.forfeits_auditor_turn)
+            && self.pending_forfeit.is_none()
+        {
+            self.end_of_turn_draw(request.auditor);
+            self.advance_turn();
+        }
+
         Ok(events)
     }
 
@@ -781,6 +822,9 @@ impl GameEngine for GameState {
                     && let ExitRule::RequiresCard(required) = self.rules.exit_rule
                     && !combo.contains(&required)
                 {
+                    continue;
+                }
+                if !self.combo_is_walkable(pawn.id, combo) {
                     continue;
                 }
                 actions.push(TurnAction::PlayCard(PlayedCard {
