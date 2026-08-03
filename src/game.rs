@@ -27,13 +27,10 @@ use crate::rules::{
 use crate::view::{self, GameView};
 
 /// One action a player may submit on their turn.
-///
-/// ARCHITECTURE.md §13 shows `PlayCard(Declaration)` — carrying only the
-/// claim, with no way to say what was truly played. That can't be right:
-/// without the real cards reaching the engine somehow, bluffing (the
-/// entire point of this game) could never work. `play::PlayedCard` exists
-/// specifically to pair a claim with what was truly played, so `PlayCard`
-/// wraps that instead.
+// `PlayCard` wraps `play::PlayedCard` (a claim paired with what was truly
+// played), not just the claim alone — without the real cards reaching the
+// engine somehow, bluffing (the entire point of this game) could never
+// work.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TurnAction {
     Audit(AuditRequest),
@@ -137,8 +134,7 @@ pub trait GameEngine {
 impl GameState {
     /// Assembles a game from already-prepared pieces — building a fresh
     /// `Deck`/hand per player, seeding the pile, and placing pawns are the
-    /// caller's job (see ARCHITECTURE.md §10's "game start" lifecycle
-    /// step); this just wires them together.
+    /// caller's job; this just wires them together.
     pub fn new(
         topology: BoardTopology,
         rules: RuleConfig,
@@ -342,13 +338,14 @@ impl GameState {
 
     /// Routes the cards from a caught automatic-audit lie (e.g. an exposed
     /// bluffed Shield) to wherever `RuleConfig::automatic_audit_reward_
-    /// destination` specifies — the piece that was previously missing
-    /// entirely: the mechanical revert (position, reinstated captures)
-    /// always applied via `pawn::revert`'s side effects, but the cards it
-    /// freed up had nowhere to go and were simply lost. Unlike a deliberate
-    /// audit, there's no `cascade_lie_rewards_destination`-style split
-    /// here — nobody chose to gamble, so the directly-reverted and
-    /// swept-up cards are treated as one undifferentiated pool.
+    /// destination` specifies. Unlike a deliberate audit, there's no
+    /// `cascade_lie_rewards_destination`-style split here — nobody chose
+    /// to gamble, so the directly-reverted and swept-up cards are treated
+    /// as one undifferentiated pool.
+    // This used to be entirely missing: the mechanical revert (position,
+    // reinstated captures) always applied via `pawn::revert`'s side
+    // effects regardless, but the cards it freed up had nowhere to go and
+    // were simply lost until this function existed.
     fn route_automatic_audit_catch(
         &mut self,
         catch: AutomaticAuditCatch,
@@ -555,8 +552,6 @@ impl GameState {
         self.players[idx].hand.extend(drawn);
     }
 
-    /// Advances `current_player` to the next player in turn order, skipping
-    /// anyone who currently owes a forfeited turn (`StunTrapCard`).
     /// Picks the next player in turn order, skipping anyone who currently
     /// owes a forfeited turn (`StunTrapCard`, one turn only) or has been
     /// eliminated (permanent, unlike a forfeit).

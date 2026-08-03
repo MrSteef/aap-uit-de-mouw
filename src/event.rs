@@ -36,18 +36,20 @@ pub enum GameEvent {
         card: CardKindId,
         was_real: bool,
     },
-    /// ARCHITECTURE.md §13 shows this carrying a full `AuditRequest`
-    /// instead of these three fields. `audit::AuditRequest` can't be
-    /// referenced here without a cycle (`event ──> audit ──> card ──>
-    /// context ──> event`, since `context` already depends on `event`) —
-    /// so the fields actually needed are inlined instead.
+    // Carries these three fields directly rather than a full
+    // `audit::AuditRequest` — that type can't be referenced here without a
+    // cycle (`event ──> audit ──> card ──> context ──> event`, since
+    // `context` already depends on `event`), so only what's actually
+    // needed is inlined.
     AuditResolved {
         auditor: PlayerId,
         target_pawn: PawnId,
         target_move_index: usize,
         outcome: AuditOutcome,
     },
-    /// Redacted per-viewer — see ARCHITECTURE.md §11.
+    /// Redacted per-viewer: which specific cards a viewer learns about
+    /// depends on `RuleConfig::reveal_collected_cards_publicly` and
+    /// whether they were a party to the transfer.
     CardsTransferred {
         from: PlayerId,
         to: PlayerId,
@@ -85,10 +87,11 @@ pub enum PileSource {
     CapturedPawnFinished,
     CascadedAuditSpoils,
     AutomaticAuditSpoils,
-    /// Not in ARCHITECTURE.md §13's original list: an audit-attempt-cost
-    /// payment (§3's `audit_attempt_cost`) that overflowed the recipient's
-    /// hand and reserve. Needed once `game.rs` (§16 step 8) actually paid
-    /// this cost somewhere.
+    /// An `audit_attempt_cost` payment that overflowed the recipient's
+    /// hand and reserve.
+    // Not in the original design's PileSource list — needed once game.rs
+    // actually started paying this cost somewhere (see the attempt-cost
+    // fields on `RuleConfig`).
     AuditAttemptCostOverflow,
     /// As above, but for a false-accusation payment
     /// (`false_accusation_card_cost`) that overflowed.

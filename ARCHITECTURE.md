@@ -47,6 +47,23 @@ relevant code, or leave them here in this document — don't carry design
 narration into rustdoc output. See `CLAUDE.md` for the full coding
 standard this applies under.
 
+**A cleanup pass has since brought the actual codebase in line with this
+standard** — the first several implementation steps accumulated exactly
+the kind of design-rationale-in-`///` this section warns against (a lot
+of it citing this very document by section number), which has now been
+split: contract-relevant content stays as `///`, rationale and
+cross-references move to plain `//` comments near the code, or are simply
+covered by this document instead. Test-only doc comments (on `#[test]`
+functions inside `#[cfg(test)]` modules) were deliberately left as-is —
+they're not part of the crate's public rustdoc regardless of comment
+style, so converting them has no real benefit. Along the way, this pass
+also caught two genuine correctness issues that were really style-cleanup
+side effects rather than the point of the exercise: a stray duplicated
+doc comment on `advance_to_next_player` left over from when it was split
+out of `advance_turn` (§13), and `RandomAgent`'s doc comment still
+describing `no_available_action_behavior` as unimplemented well after §13
+implemented it.
+
 ## Engineering philosophy: default to a gamerule
 
 The game design leans hard on `RuleConfig` — see `GAME_DESIGN.md`'s

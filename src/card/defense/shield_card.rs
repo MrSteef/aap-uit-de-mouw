@@ -6,13 +6,11 @@ use crate::pawn::{EffectAnchor, ExpiryCondition};
 /// card, not a `RuleConfig` toggle: different `CardKindId`s in the catalog
 /// can each wrap `ShieldCard` with a different duration, so "1-turn
 /// Shield" and "until it ages out Shield" can coexist as distinct cards.
-///
-/// ARCHITECTURE.md §5 defines a separate `ShieldDuration` enum
-/// (`Turns(u8)`/`UntilPawnMoves`/`UntilHistoryExpires`) with the same
-/// three variants as `pawn::ExpiryCondition`
-/// (`AfterTurns(u8)`/`OnPawnMoved`/`WithSourceHistoryItem`). Rather than
-/// keep two identical types and convert between them, `ShieldCard` just
-/// uses `ExpiryCondition` directly.
+// This reuses `pawn::ExpiryCondition` rather than a separate
+// `ShieldDuration` type with the same three variants
+// (`Turns`/`UntilPawnMoves`/`UntilHistoryExpires` vs.
+// `AfterTurns`/`OnPawnMoved`/`WithSourceHistoryItem`) — no reason to keep
+// two identical enums and convert between them.
 pub struct ShieldCard {
     pub duration: ExpiryCondition,
 }

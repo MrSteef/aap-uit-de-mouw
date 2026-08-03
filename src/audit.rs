@@ -34,16 +34,14 @@ pub struct RevertOutcome {
     pub reverted_to: SpaceId,
     /// The directly audited move's own actual cards — always destined for
     /// the auditor.
-    ///
-    /// ARCHITECTURE.md §9 shows a single flattened `cards_collected` field
-    /// here instead. That loses exactly the distinction
-    /// `RuleConfig::cascade_lie_rewards_destination` needs (whether the
-    /// cascade's *swept-up* cards follow the directly-audited move to the
-    /// auditor, or go to the pile instead) — with only one flat list,
-    /// nothing downstream could ever honor that rule. Splitting the two
-    /// preserves the information; which pile each list actually lands in
-    /// is still the caller's decision (game.rs, ARCHITECTURE.md §16 step 8),
-    /// same as every other card movement in this module.
+    // Kept separate from `swept_up_cards` rather than one flattened list
+    // (as an earlier version of this design had it) because that loses
+    // exactly the distinction `RuleConfig::cascade_lie_rewards_destination`
+    // needs: whether the cascade's *swept-up* cards follow the
+    // directly-audited move to the auditor, or go to the pile instead.
+    // Which pile each list actually lands in is still the caller's
+    // decision (game.rs), same as every other card movement in this
+    // module.
     pub directly_audited_cards: Vec<CardKindId>,
     /// Actual cards from the newer moves swept up in the cascade.
     pub swept_up_cards: Vec<CardKindId>,
@@ -89,8 +87,8 @@ pub enum AuditError {
 /// Deliberately out of scope here: paying `audit_attempt_cost` /
 /// `false_accusation_card_cost`, and routing `RevertOutcome`'s cards to
 /// hands/decks/the shared pile. Those touch multiple players' economies at
-/// once (`GameState`'s job, ARCHITECTURE.md §16 step 8) — this function
-/// only reports what happened to the audited pawn.
+/// once (`GameState`'s job) — this function only reports what happened to
+/// the audited pawn.
 pub fn resolve(
     request: &AuditRequest,
     catalog: &CardCatalog,

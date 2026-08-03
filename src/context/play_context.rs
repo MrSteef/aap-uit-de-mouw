@@ -207,10 +207,10 @@ impl<'a> PlayContext<'a> {
     /// sends `target` to one of its own yard slots.
     ///
     /// Independently callable by a future card with no movement involved
-    /// at all — ARCHITECTURE.md §4 shows this taking only `target`; the
-    /// added `is_landing` parameter is necessary since only the caller
-    /// (here, `resolve_movement`) knows whether this square is the final
-    /// one or a mid-path square under `CaptureMode::EveryStepPassed`.
+    /// at all, not just from `resolve_movement` below.
+    // `is_landing` has to be a parameter rather than inferred here, since
+    // only the caller knows whether the square in question is the move's
+    // final one or a mid-path square under `CaptureMode::EveryStepPassed`.
     pub fn attempt_capture(&mut self, target: PawnId, is_landing: bool) -> CaptureOutcome {
         let Some(target_index) = self.pawns.iter().position(|pawn| pawn.id == target) else {
             return CaptureOutcome::Proceeds;
@@ -309,9 +309,9 @@ impl<'a> PlayContext<'a> {
     /// Attaches an outstanding claimed effect, anchored to `anchor`, for
     /// whichever card `begin_card` most recently declared. Only
     /// `EffectAnchor::Pawn` is meaningful here — `ClaimedEffectState` lives
-    /// on `Pawn` (ARCHITECTURE.md §8), with no space-anchored equivalent;
-    /// a `Space`-anchored claim is silently dropped, since no card claims
-    /// one yet. Tagged with `mover`'s next move sequence, same as
+    /// on `Pawn`, with no space-anchored equivalent; a `Space`-anchored
+    /// claim is silently dropped, since no card claims one yet. Tagged
+    /// with `mover`'s next move sequence, same as
     /// `attach_persistent_effect`.
     pub fn attach_claimed_effect(&mut self, anchor: EffectAnchor) {
         let source_card = self.current_card.expect(

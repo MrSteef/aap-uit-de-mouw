@@ -28,10 +28,12 @@ pub struct Pawn {
     pub owner: PlayerColor,
     pub position: SpaceId,
     persistent_effects: Vec<PersistentEffectState>,
-    /// Outstanding *claims* of a persistent effect, tracked separately from
-    /// real ones — see the anchor-mismatch note in ARCHITECTURE.md §5.
-    /// Resolved (removed) the moment `trigger_automatic_audit` tests the
-    /// specific one it's about, one way or another.
+    /// Outstanding *claims* of a persistent effect, tracked separately
+    /// from real ones. Resolved (removed) the moment
+    /// `trigger_automatic_audit` tests the specific one it's about, one
+    /// way or another.
+    // See the anchor-mismatch note in ARCHITECTURE.md §5 for why these
+    // need their own list rather than being merged with the real ones.
     claimed_effects: Vec<ClaimedEffectState>,
     /// Capacity is bounded to `RuleConfig::audit_window` by whoever calls
     /// `push_move`, not enforced internally by this type.
@@ -45,11 +47,10 @@ pub struct Pawn {
 
 /// Anchors a persistent effect to a pawn (follows it wherever it goes) or a
 /// space (stays behind after whichever pawn triggered it leaves).
-///
-/// Defined here rather than alongside `PlayContext` in `context/` (where
-/// ARCHITECTURE.md §4 shows it) because `PersistentEffectState` below needs
-/// it and, per §1's dependency graph, `pawn` must not depend on `context` —
-/// `context` depends on `pawn`, not the reverse.
+// Defined here rather than alongside `PlayContext` in `context/` (where
+// ARCHITECTURE.md §4 shows it) because `PersistentEffectState` below needs
+// it and, per §1's dependency graph, `pawn` must not depend on `context` —
+// `context` depends on `pawn`, not the reverse.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EffectAnchor {
     Pawn(PawnId),
@@ -143,9 +144,9 @@ impl Pawn {
     /// Pushes `record` onto this pawn's history, stamping it with the next
     /// sequence number first (overwriting whatever `record.sequence` was
     /// set to). If that leaves more than `window` records, the oldest one
-    /// ages out and is returned — its cards are the caller's responsibility
-    /// to route back to the owner's reserve (ARCHITECTURE.md §10). `None`
-    /// if nothing aged out.
+    /// ages out and is returned — its cards are the caller's
+    /// responsibility to route back to the owner's reserve. `None` if
+    /// nothing aged out.
     pub fn push_move(&mut self, mut record: MoveRecord, window: usize) -> Option<MoveRecord> {
         record.sequence = self.next_move_sequence;
         self.next_move_sequence += 1;
@@ -216,7 +217,7 @@ impl Pawn {
     /// Called when this pawn's first move *out* of the yard resolves.
     /// Every still-attached record is treated exactly like a natural
     /// age-out at this point — returns their cards for the caller to send
-    /// to the owner's reserve (ARCHITECTURE.md §10).
+    /// to the owner's reserve.
     pub fn clear_history_on_exit(&mut self) -> Vec<CardKindId> {
         self.drain_history_cards()
     }
@@ -262,8 +263,8 @@ impl Pawn {
 /// it, whose lie it was, and what the mechanical revert produced. Recorded
 /// rather than acted on immediately — routing the cards to a player or the
 /// shared pile touches the wider game economy (caps, other players'
-/// hands), which is `GameState`'s job (ARCHITECTURE.md §16 step 8), not
-/// something a card's own hook can reach.
+/// hands), which is `GameState`'s job, not something a card's own hook can
+/// reach.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AutomaticAuditCatch {
     pub attacker: PawnId,

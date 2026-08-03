@@ -26,13 +26,12 @@ pub enum CardCategory {
 }
 
 /// Whether an audited move's claim matched what was truly played.
-///
-/// Defined here rather than in `audit.rs` (where ARCHITECTURE.md §9 shows
-/// it) because `CardBehavior`'s audit hooks below need it, and `audit ──>
-/// card` per §1's dependency graph — `card` must not depend on `audit`.
-/// This mirrors why `EffectAnchor` lives in `pawn.rs` instead of
-/// `context/`: the type moves to whichever module is lower in the
-/// dependency graph among the ones that need it.
+// Defined here rather than in `audit.rs` (where ARCHITECTURE.md §9 shows
+// it) because `CardBehavior`'s audit hooks below need it, and
+// `audit ──> card` per §1's dependency graph — `card` must not depend on
+// `audit`. This mirrors why `EffectAnchor` lives in `pawn.rs` instead of
+// `context/`: the type moves to whichever module is lower in the
+// dependency graph among the ones that need it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AuditOutcome {
     LieCaught,
